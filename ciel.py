@@ -192,7 +192,13 @@ def predict(
     request = urllib.request.Request(
         base_url() + DECIDE_PATH,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            # Opt this client into Decision Lab's traffic capture so its calls
+            # can be labeled and used as real training data. The server only
+            # logs when web.log_traffic is also enabled.
+            "X-Decision-Lab-Log": "1",
+        },
         method="POST",
     )
     try:
