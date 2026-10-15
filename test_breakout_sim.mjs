@@ -14,7 +14,7 @@ import {
   W, H, ROWS, COLS, PADDLE_W, PADDLE_H, PADDLE_Y, PADDLE_SPEED, BALL_R,
   BRICK_H, BRICK_GAP, BRICK_TOP, CATCH_HALF, PADDLE_MIN, PADDLE_MAX,
   BALL_MIN_X, BALL_MAX_X, BAND_ENTER_Y, BAND_EXIT_Y, LAST_BRICK_BOTTOM,
-  CATCH_TOL_PX, DEFAULT_CONFIG, QUESTION,
+  CATCH_TOL_PX, DEFAULT_CONFIG, QUESTION, STAY_BAND_PX,
   createSim, startGame, resetBall, aliveBricks, setBallSpeed, step,
   measure, buildState, decidable, reflectX, rolloutReachable, buildLandingX, aimTarget,
 } from "./static/breakout_sim.js";
@@ -306,18 +306,24 @@ test("the two regimes disagree on this ball — and that disagreement is the dem
   assert.equal(m.gap, m.landingX - sim.paddleX);
   assert.match(buildState(sim).situation, /RIGHT/,
     "ontology ON: the observation follows the LANDING point — right of the paddle");
-  assert.match(buildState(sim).situation, /It will land at x≈197/);
+  // The landing sentence restates the landing SIDE, not the raw landingX: absolute
+  // coordinates appear in no training state (0 occurrences of "x≈" in the breakout
+  // JSONL) and collapsed the local ciel head to one class.
+  assert.match(buildState(sim).situation, /It will land clearly to the RIGHT of the paddle \(gap \d+ px\)/);
+  assert.doesNotMatch(buildState(sim).situation, /x≈/,
+    "absolute coordinates are gone — they are out of the head's training distribution");
   sim.config.enforceReachability = false;
   const off = buildState(sim).situation;
   assert.match(off, /LEFT/,
     "ontology OFF: the observation follows the CURRENT position — and says the wrong side");
-  assert.doesNotMatch(off, /It will land at/);
+  assert.doesNotMatch(off, /It will land/);
 });
 
-test("with the ontology on, the input gains the absolute coordinates the gap came from", () => {
+test("with the ontology on, the input states the landing side in the gap prose", () => {
   // ON: the side is named from the LANDING point (gap = landingX − paddleX, what the
-  // 12.4% fix made it) and the two absolute x positions are appended — coordinates
-  // WITHOUT the prose were measured at a threefold score collapse, so the prose stays.
+  // 12.4% fix made it) and the landing sentence restates that gap in the phrasing the
+  // renderer emits. It used to print the two absolute x positions; that form appears in
+  // no training state and collapsed the local ciel head, so it was replaced by prose.
   // OFF: the side is named from the ball's CURRENT position — the deliberate naive
   // baseline, which on this fixture names the opposite side.
   const sim = fresh({ ball: { x: 200, y: 200, vx: 200, vy: 160 } });
@@ -328,19 +334,85 @@ test("with the ontology on, the input gains the absolute coordinates the gap cam
   assert.notEqual(Math.sign(sim.ball.x - sim.paddleX), Math.sign(m.gap),
     "fixture is only meaningful while current and landing disagree");
   const on = buildState(sim).situation;
-  assert.match(on, /It will land at x≈/);
-  assert.match(on, new RegExp(`x≈${Math.round(m.landingX)}`),
-    "the stated coordinate must be the rollout's landing point");
-  assert.match(on, new RegExp(`paddle is at x≈${Math.round(sim.paddleX)}`),
-    "an absolute landing point without the paddle's own position is not actionable");
+  assert.match(on, /It will land /, "ON states where the ball will land");
+  assert.match(on, new RegExp(`gap ${Math.abs(Math.round(m.gap))} px`),
+    "the landing sentence restates the rollout's gap");
+  assert.doesNotMatch(on, /x≈/,
+    "no absolute coordinates: absent from training, and they collapsed the head");
   assert.match(on, /gap \d+ px/, "the gap prose survives — the model keys on it (measured)");
   assert.match(on, m.gap > 0 ? /RIGHT/ : /LEFT/, "ON names the landing side");
   sim.config.enforceReachability = false;
   const off = buildState(sim).situation;
   assert.match(off, /gap \d+ px/, "switch off: the prose shape survives");
-  assert.doesNotMatch(off, /It will land at/, "switch off: no prediction, no coordinates");
+  assert.doesNotMatch(off, /It will land/, "switch off: no prediction, no landing sentence");
   assert.match(off, sim.ball.x - sim.paddleX > 0 ? /RIGHT/ : /LEFT/,
     "OFF names the CURRENT side — the deliberate naive baseline");
+});
+
+test("the descent clause is a sentence, not a clause merged into the geometry", () => {
+  // The renderer emits "Falling toward the paddle." as its OWN sentence
+  // (states/breakout.py `_motion_echo`). Merging it into the geometry sentence
+  // ("...and down, falling toward the paddle") puts a phrase the head never saw in
+  // that position into the attended field, and it dominated the geometry: measured
+  // against the local decision_lab head, the merged form answered "left" for a ball
+  // plainly right of the paddle (right-prob 0.41, vs OK with the clause separated).
+  const sim = fresh({ ball: { x: 600, y: 200, vx: -200, vy: 160 } });
+  sim.paddleX = 100;
+  const m = measure(sim);
+  assert.equal(m.descending, true, "fixture must be a descending ball");
+  const on = buildState(sim).situation;
+  assert.match(on, /down, toward the paddle\. Falling toward the paddle\./,
+    "descent is stated as two sentences, matching the training prose");
+  assert.doesNotMatch(on, /down, falling/,
+    "the merged clause is what breaks the head — it must not come back");
+  // The rising case keeps its own single phrase (also verbatim from _motion_echo).
+  const rising = fresh({ ball: { x: 600, y: 200, vx: -200, vy: -160 } });
+  rising.paddleX = 100;
+  assert.equal(measure(rising).descending, false, "fixture must be a rising ball");
+  assert.match(buildState(rising).situation, /up, away from the paddle/);
+});
+
+test("a centered ball takes the renderer's CENTER path, not the side path", () => {
+  // states/breakout.py renders side == "center" differently in BOTH parts of the
+  // motion clause: _short_motion ("drifting left, falling") instead of
+  // _motion_phrase ("moving left and down, toward the paddle"), and
+  // _motion_echo(centre) == "The paddle is under the ball" instead of the
+  // toward/away clause. "moving left and down" occurs 0 times among the training
+  // center states, and the side path was measured to answer a centered ball
+  // "right" with stay-prob as low as 0.00; the center path answers "stay"
+  // throughout (0.88-0.94 over gaps 0..24).
+  // OFF regime, so the side reads straight from ball.x - paddleX and the fixture
+  // is exact. (Under ON the gap is the landing point, which this fixture does not
+  // try to control — the center path is reached in both regimes the same way.)
+  const sim = fresh({ ball: { x: 348, y: 200, vx: -40, vy: 160 } });
+  sim.paddleX = 350;                       // 2 px off: inside STAY_BAND_PX
+  sim.config.enforceReachability = false;
+  assert.ok(Math.abs(sim.ball.x - sim.paddleX) <= STAY_BAND_PX,
+    "fixture must be centered under the sim's own band");
+  const off = buildState(sim).situation;
+  assert.match(off, /almost directly above the paddle \(offset \d+ px\)/);
+  assert.match(off, /drifting left, falling/,
+    "centred uses the short motion words, not the side phrase");
+  assert.match(off, /The paddle is under the ball/,
+    "and the centre echo, which is what marks the ball as centered");
+  assert.doesNotMatch(off, /moving left and down/,
+    "the side motion phrase is what the head has no training for at center");
+});
+
+test("the centered band matches the training threshold, not a tighter one", () => {
+  // The head learned "stay" for gaps 0..24 (STAY_THRESHOLD_PX) and flips only
+  // past it — measured: stay-prob 0.90 at both 16 and 24, then 0.01 at 26. A
+  // narrower band would describe a 20 px gap as a side, which is both wrong to
+  // the head and prose the renderer never emits for that number.
+  assert.equal(STAY_BAND_PX, 24);
+  const sim = fresh({ ball: { x: 370, y: 200, vx: -40, vy: 160 } });
+  sim.paddleX = 350;                       // 20 px — inside the band
+  sim.config.enforceReachability = false;
+  assert.match(buildState(sim).situation, /almost directly above the paddle/,
+    "20 px is centered: inside the training band");
+  sim.ball = { x: 382, y: 200, vx: -40, vy: 160 };   // 32 px — past it
+  assert.match(buildState(sim).situation, /clearly to the RIGHT of the paddle/,
+    "32 px is a side: the training band ends before it");
 });
 
 test("the ON observation names the wrong side 0% of the time; the OFF baseline 12.4%", () => {
