@@ -481,3 +481,214 @@ def test_ciel_rejects_unknown_model_still(client, ciel_stub):
         "model": "gpt-4",
     })
     assert response.status_code == 422
+
+# ---- /api/transcribe -------------------------------------------------------------
+#
+# The endpoint is exercised with asr.transcribe stubbed, so these run with no model, no
+# network and no microphone — same contract the rest of this file holds to. What is
+# tested here is the WIRING: validation, status codes, and the fact that transcription
+# does not go through laya's predict_lock.
+
+
+def _wav(seconds: float = 0.5, rate: int = 16000) -> bytes:
+    """A minimal mono 16-bit PCM WAV, built without numpy so this file needs no import."""
+    import io
+    import math
+    import struct
+    import wave
+
+    n = int(seconds * rate)
+    pcm = b"".join(
+        struct.pack("<h", int(12000 * math.sin(2 * math.pi * 220 * i / rate)))
+        for i in range(n)
+    )
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+@pytest.fixture()
+def asr_stub(monkeypatch):
+    """Replace asr.transcribe with a recorder that returns a fixed transcript."""
+    calls = []
+
+    def fake_transcribe(wav_bytes, lang="en"):
+        calls.append({"bytes": len(wav_bytes), "lang": lang})
+        return {"transcript": "turn left", "model": f"stub-{lang}", "lang": lang,
+                "duration_s": 1.0}
+
+    monkeypatch.setattr(server_module.asr, "transcribe", fake_transcribe)
+    return calls
+
+
+def test_transcribe_returns_the_transcript(client, asr_stub):
+    test_client, _ = client
+    response = test_client.post(
+        "/api/transcribe?lang=en", content=_wav(),
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["transcript"] == "turn left"
+    assert body["lang"] == "en"
+    assert body["latency_ms"] >= 0
+    assert asr_stub[0]["lang"] == "en"
+
+
+def test_transcribe_defaults_to_english(client, asr_stub):
+    test_client, _ = client
+    response = test_client.post("/api/transcribe", content=_wav(),
+                                headers={"content-type": "application/octet-stream"})
+    assert response.status_code == 200
+    assert asr_stub[0]["lang"] == "en"
+
+
+def test_transcribe_passes_the_language_through(client, asr_stub):
+    test_client, _ = client
+    response = test_client.post("/api/transcribe?lang=ko", content=_wav(),
+                                headers={"content-type": "application/octet-stream"})
+    assert response.status_code == 200
+    assert asr_stub[0]["lang"] == "ko"
+
+
+def test_transcribe_rejects_an_unsupported_language(client, asr_stub):
+    test_client, _ = client
+    response = test_client.post("/api/transcribe?lang=fr", content=_wav(),
+                                headers={"content-type": "application/octet-stream"})
+    assert response.status_code == 422
+    assert "unsupported lang" in response.json()["detail"]
+    assert not asr_stub, "the stub ran despite an invalid language"
+
+
+def test_transcribe_rejects_an_empty_body(client, asr_stub):
+    test_client, _ = client
+    response = test_client.post("/api/transcribe", content=b"",
+                                headers={"content-type": "application/octet-stream"})
+    assert response.status_code == 422
+    assert not asr_stub
+
+
+def test_transcribe_rejects_an_oversized_body(client, asr_stub):
+    test_client, _ = client
+    big = b"\x00" * (server_module.MAX_AUDIO_BYTES + 1)
+    response = test_client.post("/api/transcribe", content=big,
+                                headers={"content-type": "application/octet-stream"})
+    assert response.status_code == 413
+    assert not asr_stub, "an oversized body reached the model"
+
+
+def test_transcribe_maps_a_bad_recording_to_400(client, monkeypatch):
+    """A bad-body failure carries no status, so it must surface as a client error."""
+    test_client, _ = client
+
+    def boom(wav_bytes, lang="en"):
+        raise server_module.asr.AsrError("not a readable WAV: nope")
+
+    monkeypatch.setattr(server_module.asr, "transcribe", boom)
+    response = test_client.post("/api/transcribe", content=_wav(),
+                                headers={"content-type": "application/octet-stream"})
+    assert response.status_code == 400
+    assert "not a readable WAV" in response.json()["detail"]
+
+
+def test_transcribe_maps_a_load_failure_to_502(client, monkeypatch):
+    """A load failure carries a status, so it must surface as upstream, not as the
+    caller's fault — that is what lets the UI say "check your connection"."""
+    test_client, _ = client
+
+    def boom(wav_bytes, lang="en"):
+        raise server_module.asr.AsrError("could not load the checkpoint", status=502)
+
+    monkeypatch.setattr(server_module.asr, "transcribe", boom)
+    response = test_client.post("/api/transcribe", content=_wav(),
+                                headers={"content-type": "application/octet-stream"})
+    assert response.status_code == 502
+    assert "could not load" in response.json()["detail"]
+
+
+def test_transcribe_works_when_the_laya_router_is_cold(monkeypatch, asr_stub):
+    """Voice must not wait on laya. The router is None here; the request still succeeds.
+
+    This is the same property jev and ciel have, and it is the reason /api/transcribe
+    does not take predict_lock or 503 on a cold router.
+    """
+    monkeypatch.setattr(server_module._RouterState, "router", None)
+    test_client = TestClient(server_module.app)
+    response = test_client.post("/api/transcribe", content=_wav(),
+                                headers={"content-type": "application/octet-stream"})
+    assert response.status_code == 200
+    assert response.json()["transcript"] == "turn left"
+
+
+def test_health_is_unchanged_by_the_new_endpoint(client):
+    """The penguin demo must not change what /api/health reports."""
+    test_client, _ = client
+    assert test_client.get("/api/health").json() == {"ready": True}
+
+
+def test_transcribe_rejects_an_oversized_content_length_before_reading(client, asr_stub):
+    """REGRESSION. The guard used to run only after `await request.body()` had buffered
+    the whole upload, so it rejected large bodies but did not bound memory. The declared
+    length must be refused up front."""
+    test_client, _ = client
+    response = test_client.post(
+        "/api/transcribe", content=b"",
+        headers={"content-type": "application/octet-stream",
+                 "content-length": str(server_module.MAX_AUDIO_BYTES + 1)},
+    )
+    assert response.status_code == 413
+    assert "too large" in response.json()["detail"]
+    assert not asr_stub, "an oversized body reached the model"
+
+
+def test_transcribe_still_checks_the_real_length_when_the_header_lies(client, asr_stub):
+    """A chunked upload declares no length. The post-read check must still catch it."""
+    test_client, _ = client
+    big = b"\x00" * (server_module.MAX_AUDIO_BYTES + 1)
+    response = test_client.post(
+        "/api/transcribe", content=big,
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert response.status_code == 413
+    assert not asr_stub
+
+
+def test_transcribe_accepts_a_usable_content_length(client, asr_stub):
+    """The pre-check must not reject legitimate uploads."""
+    test_client, _ = client
+    wav = _wav()
+    response = test_client.post(
+        "/api/transcribe", content=wav,
+        headers={"content-type": "application/octet-stream",
+                 "content-length": str(len(wav))},
+    )
+    assert response.status_code == 200
+
+
+def test_transcribe_language_is_normalised_like_asr_does(client, asr_stub):
+    """asr folds case and whitespace; the endpoint must not be stricter than the module
+    it fronts."""
+    test_client, _ = client
+    for lang in ["en", "EN", " en "]:
+        asr_stub.clear()
+        response = test_client.post(
+            f"/api/transcribe?lang={lang}", content=_wav(),
+            headers={"content-type": "application/octet-stream"},
+        )
+        assert response.status_code == 200, f"{lang!r} was rejected"
+
+
+def test_a_truncated_wav_body_returns_400_not_500(client):
+    """End to end through the real decoder (not a stub): a 4-byte body must be a client
+    error, not an unhandled EOFError."""
+    test_client, _ = client
+    response = test_client.post(
+        "/api/transcribe", content=b"RIFF",
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert response.status_code == 400, response.text
+    assert "not a readable WAV" in response.json()["detail"]

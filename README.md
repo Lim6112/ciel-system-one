@@ -51,7 +51,8 @@ Two consequences worth knowing:
 Verified on Intel: `main.py` runs both checkpoints, 19 Python and 45 Node tests
 pass. The arm64 column is from resolution, not execution. (The Node suite has since
 grown — `node --test test_breakout_sim.mjs test_breakout_ontology.mjs test_ontology.mjs
-test_fleet_sim.mjs` now runs 114 tests, all green.)
+test_fleet_sim.mjs test_penguin_sim.mjs test_penguin_commands.mjs` now runs 178
+tests, all green, and `uv run pytest` runs 82.)
 
 ## Web UI
 
@@ -84,6 +85,12 @@ metadata (model, repo, reason, latency).
   `node --test test_fleet_sim.mjs`
 - `test_breakout_sim.mjs` / `test_breakout_ontology.mjs` — breakout invariants and the
   ontology's falsifiability tests: `node --test test_breakout_sim.mjs test_breakout_ontology.mjs`
+- `test_penguin_sim.mjs` / `test_penguin_commands.mjs` — the penguin's world rules and the
+  transcript→command mapping, no model load:
+  `node --test test_penguin_sim.mjs test_penguin_commands.mjs`
+- `asr.py` — local speech recognition (Moonshine tiny) for the penguin demo; `test_asr.py`
+  covers WAV decoding and the offline-flag handling, no model load:
+  `uv run pytest test_asr.py`
 
 ### laya plays Breakout
 
@@ -246,6 +253,151 @@ trained on — which is the whole reason the injection is doing something.
 `no-rules` and `greedy` show *negative* nearest-regret, which is not a bug: the
 optimum is restricted to buses that can take the work, and the naive dispatcher
 picks the closest bus whether or not it has room.
+
+### laya listens to the penguin
+
+`static/penguin.html` (linked from the UI header) is a penguin on an ice floe that
+takes spoken commands. You say `go`, `back`, `turn left` or `turn right`; a local
+speech recogniser transcribes it; the transcript becomes a command; the penguin
+walks, turns, eats fish, and stops at open water and at the edge of the floe. It is
+the only demo here with an audio input, and the only one whose input is *speech*
+rather than text typed into a box.
+
+The screen shows the floe with the penguin, the fish it is collecting, the open
+water it must not walk into, "What the model is told" (the exact state text), and
+"Which command did that mean?" (the four command bars, confidence, latency, and a
+history). A **rules** reader and a **laya** reader both answer that question — see
+below, because the difference between them is the point.
+
+#### Speech recognition: Moonshine tiny, and why not Whisper
+
+`asr.py` wraps [Moonshine](https://github.com/moonshine-ai/moonshine) tiny, which
+matters for one unglamorous reason: **it is already installed**.
+`transformers>=5` ships `MoonshineForConditionalGeneration`, so this adds a model
+but not a single package — `pyproject.toml` is unchanged. Against Whisper tiny on
+the same speech it is both faster and more accurate (34 ms vs 277 ms on an M-series
+Mac; 12.00% vs 12.81% WER), which for a command answered out loud is the whole
+ballgame. Both are ~27M parameters.
+
+| Arm | Checkpoint | Size | Licence |
+| --- | --- | --- | --- |
+| English | `UsefulSensors/moonshine-tiny` | ~110 MB | MIT |
+| Korean | `UsefulSensors/moonshine-tiny-ko` | ~110 MB | **not MIT** (`other`) |
+
+The Korean checkpoint is a separate release with a non-MIT licence — noted here
+rather than buried, because redistributing this demo downstream is a real scenario.
+Weights download on first use (`uv run uvicorn server:app` will pause once) and are
+cached by `transformers` afterwards.
+
+There is **no audio dependency at all** — no ffmpeg, librosa, soundfile, torchaudio
+or `av`. The browser captures raw Float32 through an `AudioWorklet`, resamples to
+16 kHz mono with an `OfflineAudioContext`, and assembles a PCM WAV in JavaScript; the
+server only ever sees that one format, which the stdlib `wave` module reads.
+`MediaRecorder` is deliberately avoided — it returns webm/opus in Chrome and
+something else again in Safari, and decoding either server-side would mean shipping
+ffmpeg.
+
+One hazard is worth recording. `laya_startup.py` sets `HF_HUB_OFFLINE=1` so laya never
+reaches for the network mid-prediction, and that flag would also stop the first
+Moonshine download dead. `asr.py` lifts it around the load and restores the original
+value afterwards (`_hub_online`), rather than clearing it process-wide — the flag is
+there for a reason and it is not this module's to change. `test_asr.py` pins that
+window, including that the value is restored verbatim and after an exception.
+
+#### The state laya is asked to route
+
+The question is `command: choice(go/back/turn_left/turn_right)`, and the state is the
+transcript plus the penguin's four neighbours as prose:
+
+```json
+{
+  "spoken instruction": "turn left please",
+  "penguin is facing": "north",
+  "ahead of the penguin": "a fish",
+  "to the left of the penguin": "open water",
+  "to the right of the penguin": "open ice",
+  "behind the penguin": "open ice",
+  "steps remaining": "28",
+  "fish remaining": "5"
+}
+```
+
+`buildState` in `static/penguin_sim.js` is a *formatter over* `measure()`, the same
+one-value-two-readers rule the other sims follow — so the sentence the model reads
+and the value the tests assert over cannot drift. The neighbours are named by
+`describeCell`, which keeps "open water" and "the edge of the floe" distinct; a test
+asserts they stay distinct, since a blocked move is a different sentence depending on
+which one stopped it.
+
+#### Two readers, and what the difference shows
+
+| Reader | What it is | When to use it |
+| --- | --- | --- |
+| `rules` (default) | keyword table in `static/penguin_commands.js` — no model, no network | always works, deterministic, replayable |
+| `laya` | the transcript + the floe sent to `/api/predict` | to watch a model route the same sentence |
+
+Measured on the four commands, the `laya` reader is good in English and bad in
+Korean. Both are reported here as measured, not as designed:
+
+| Transcript | Result | Winner probability |
+| --- | --- | --- |
+| `go forward` | `go` | 0.92 |
+| `go back` | `back` | 0.80 |
+| `turn left` | `turn_left` | 0.70 |
+| `turn right` | `turn_right` | 0.88 |
+| `앞으로` / `뒤로` | `go` (both) | 0.49 / 0.52 |
+| `왼쪽으로 돌아` / `오른쪽으로 돌아` | `go` (both) | 0.55 / 0.53 |
+
+Korean collapses to `go` — a confident wrong answer rather than an error. The cause
+is upstream of the penguin: laya's language detector reports Korean text as
+`script: latin`, so `auto` hands it to the *English* checkpoint, and every Korean
+command comes back `go`. The `multilingual` checkpoint does not fix it either (it
+answers `back` for all four, in both languages). The Korean **recognition** is fine —
+`moonshine-tiny-ko` transcribes 앞으로, 왼쪽으로 돌아 and 오른쪽으로 돌아 correctly —
+so the failure is entirely in the routing step. The page shows a warning when Korean
+and a model reader are both selected, rather than hiding it or quietly disabling the
+arm.
+
+This is the same class of problem the breakout notes describe from the other side: a
+head asked about prose outside its training distribution can answer confidently and
+wrongly, and the honest response is to measure it, say so, and keep a deterministic
+path available. It is also why `rules` is the default and the fallback — when laya is
+unavailable the page falls back to it *loudly*, recording the failure in the history
+instead of going quiet.
+
+#### Running it
+
+```bash
+uv run uvicorn server:app          # first run downloads ~110 MB of Moonshine
+# open http://localhost:8000/penguin.html
+```
+
+No microphone? Press <kbd>G</kbd>/<kbd>B</kbd>/<kbd>L</kbd>/<kbd>R</kbd> (or the arrow
+keys), or use the four buttons. They drive the identical code path, so a scenario
+replays exactly. To exercise the endpoint directly:
+
+```bash
+curl -s -X POST --data-binary @sample.wav \
+  'http://localhost:8000/api/transcribe?lang=en' | python3 -m json.tool
+```
+
+The recogniser wants 16 kHz mono 16-bit PCM WAV and returns 400 for anything else
+rather than guessing; `afconvert` or `ffmpeg -ar 16000 -ac 1` will produce one.
+
+#### Limitations
+
+- **Korean does not route through laya** (table above). Use `rules` for Korean.
+- **Isolated single words transcribe worse than phrases.** Measured with macOS `say`:
+  `turn left` as one word came back `"And they predict."`, while `"Please go back to
+  the start."` came back near-correct and real recorded speech was exact. A 27M model
+  on a half-second clip has very little to go on. Speaking a short phrase works
+  noticeably better than barking one word.
+- **Not streaming.** Recording is per-utterance — click, speak, click — with a 25 s
+  ceiling. No wake word.
+- **No ontology panel**, unlike breakout and fleet. The interesting axis here is
+  speech→command, and an ontology would be a third thing competing for the screen.
+- **The blocked step costs a step.** Deliberate — if walking into water were free,
+  what is ahead would not matter and asking the model about it would be theatre.
 
 #### ciel_decision_model_v1 — a local dynamic-head backend
 
