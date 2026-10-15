@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CJet listens to the penguin</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #d9dde3; --text: #1c2128;
+    --muted: #6b7280; --accent: #4f46e5; --accent-soft: #eef2ff;
+    --danger: #b91c1c; --danger-bg: #fef2f2; --ok: #047857;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header { padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { margin: 0; font-size: 17px; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  header a { color: var(--accent); text-decoration: none; }
+  header a:hover { text-decoration: underline; }
+  main {
+    display: grid; grid-template-columns: minmax(420px, 6fr) minmax(340px, 5fr);
+    gap: 20px; padding: 20px 24px; max-width: 1200px; margin: 0 auto;
+  }
+  @media (max-width: 940px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase;
+    letter-spacing: 0.04em; color: var(--muted); }
+  canvas { display: block; width: 100%; border-radius: 8px; }
+  .hud { display: flex; justify-content: space-between; color: var(--muted);
+    font-size: 13px; margin-bottom: 8px; }
+  .hud strong { color: var(--text); }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
+    background: var(--accent-soft); color: var(--accent); font-weight: 600;
+    font-size: 12px; visibility: hidden; }
+  .badge.on { visibility: visible; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+  .controls label { color: var(--muted); font-size: 13px; }
+  .controls .ctl { display: flex; align-items: center; gap: 6px; }
+  button, select {
+    font: inherit; border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 12px; background: #fff; cursor: pointer; color: var(--text);
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent);
+    color: #fff; font-weight: 600; }
+  button.primary:hover { opacity: 0.9; color: #fff; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .bar { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+  .bar .bar-label { flex: 0 0 74px; color: var(--muted); font-size: 12px; }
+  .bar .bar-track { flex: 1; height: 10px; background: var(--accent-soft);
+    border-radius: 5px; overflow: hidden; }
+  .bar .bar-fill { height: 100%; background: var(--accent); border-radius: 5px;
+    transition: width 120ms; }
+  .bar.winner .bar-label { color: var(--text); font-weight: 600; }
+  .bar.winner .bar-fill { background: var(--ok); }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .ok { color: var(--ok); font-size: 12px; margin: 6px 0; }
+  .bad { color: var(--danger); font-size: 12px; margin: 6px 0; }
+  .warn { color: #a16207; font-size: 12px; margin: 6px 0; }
+  #stateView { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; color: var(--muted); white-space: pre-wrap; }
+  #history div { font-size: 12px; color: var(--muted); padding: 1px 0; }
+
+  /* Mic button + level meter */
+  .microw { display: flex; align-items: center; gap: 12px; }
+  #micBtn { border-radius: 999px; padding: 10px 20px; }
+  #micBtn.rec { background: var(--danger); border-color: var(--danger); color: #fff;
+    font-weight: 600; animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.65; } }
+  .meter { flex: 1; height: 8px; background: var(--accent-soft); border-radius: 4px;
+    overflow: hidden; }
+  .meter > div { height: 100%; width: 0%; background: var(--accent);
+    transition: width 60ms; }
+  #transcript { font-size: 15px; margin-top: 10px; min-height: 22px; }
+  #transcript .none { color: var(--muted); font-size: 13px; }
+  .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+    background: var(--accent-soft); color: var(--accent); border-radius: 4px;
+    padding: 1px 5px; }
+  .cmds { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .cmds button { font-size: 12px; padding: 4px 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CJet listens to the penguin 🐧</h1>
+  <p>Speak a command → local Moonshine transcribes it → the penguin obeys
+     (<code>go</code> / <code>back</code> / <code>turn left</code> / <code>turn right</code>).
+     <a href="/">← back to the main UI</a></p>
+</header>
+<main>
+  <section>
+    <div class="panel">
+      <div class="hud">
+        <span>Fish <strong id="collected">0</strong> / <strong id="fishTotal">6</strong></span>
+        <span>Steps left <strong id="stepsLeft">30</strong></span>
+        <span>Facing <strong id="facing">north</strong></span>
+        <span class="badge" id="doneBadge"></span>
+      </div>
+      <canvas id="scene" width="600" height="440"></canvas>
+      <div class="meta" id="lastMove">say something, or press <span class="kbd">G</span>
+        <span class="kbd">B</span> <span class="kbd">L</span> <span class="kbd">R</span></div>
+    </div>
+
+    <div class="panel">
+      <h2>Microphone</h2>
+      <div class="microw">
+        <button id="micBtn">🎤 Hold a thought, then click</button>
+        <div class="meter"><div id="level"></div></div>
+      </div>
+      <div id="transcript"><span class="none">nothing heard yet</span></div>
+      <div class="meta" id="asrMeta"></div>
+      <div id="langNote" class="warn" style="display:none"></div>
+      <div class="cmds">
+        <button data-cmd="go">go</button>
+        <button data-cmd="back">back</button>
+        <button data-cmd="turn_left">turn left</button>
+        <button data-cmd="turn_right">turn right</button>
+      </div>
+      <div class="meta">The four buttons and the keyboard do the same thing as speech —
+        they are the fallback when a mic is unavailable, and the way to replay a scenario
+        exactly.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Controls</h2>
+      <div class="controls">
+        <button id="resetBtn" class="primary">New floe</button>
+        <button id="replayBtn">Same floe</button>
+        <span class="ctl"><label>Language</label>
+          <select id="lang">
+            <option value="en">english</option>
+            <option value="ko">한국어</option>
+          </select></span>
+        <span class="ctl"><label>Decides with</label>
+          <select id="model">
+            <option value="rules">rules (keyword match — always works)</option>
+            <option value="auto">laya (auto)</option>
+            <option value="english">laya (english)</option>
+            <option value="multilingual">laya (multilingual)</option>
+            <option value="typed-decisions">laya (typed-decisions)</option>
+          </select></span>
+        <span class="ctl"><label>Steps</label>
+          <input type="range" id="budget" min="10" max="60" step="5" value="30">
+          <label id="budgetLabel">30</label></span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="panel">
+      <h2>What the model is told</h2>
+      <div id="stateView">nothing yet</div>
+    </div>
+    <div class="panel">
+      <h2>Which command did that mean?</h2>
+      <div id="decisionBars"></div>
+      <div class="meta" id="decisionMeta">no readings yet</div>
+      <div id="history"></div>
+    </div>
+    <details class="panel">
+      <summary><strong>Why two readers?</strong></summary>
+      <p style="color:var(--muted);font-size:13px">
+        The <strong>rules</strong> reader is a keyword table — no model, no download, no
+        network, so the demo works on a cold laptop and a transcript like
+        <em>"go back"</em> resolves the same way every time. The <strong>laya</strong>
+        reader hands the transcript and the penguin's surroundings to a decision model and
+        asks which of the four commands it means. Switching between them is the point:
+        watch the same sentence land on the same bars, or not.
+      </p>
+      <p style="color:var(--muted);font-size:13px">
+        Speech recognition is <strong>Moonshine tiny</strong>, running locally — 27M
+        parameters, about 110&nbsp;MB, downloaded once. Nothing is sent anywhere.
+      </p>
+    </details>
+  </section>
+</main>
+
+<script type="module">
+// ---- DOM layer over penguin_sim.js -----------------------------------------
+//
+// The walking, turning, fish and blockers all live in penguin_sim.js, which touches no
+// DOM. This file is only what a browser has and node does not: the canvas, the
+// microphone, the Web Audio plumbing, and the fetch. That split is why
+// `node --test test_penguin_sim.mjs` can check the world rules without a page.
+
+import {
+  CELL, COLS, ROWS, W, H, HEADINGS, QUESTION,
+  createSim, resetSim, applyCommand, step, isAnimating,
+  measure, buildState,
+} from "/penguin_sim.js";
+import { parseCommand, describeCommand } from "/penguin_commands.js";
+
+const canvas = document.getElementById("scene");
+const ctx = canvas.getContext("2d");
+
+// ---- simulation ------------------------------------------------------------
+
+let sim = createSim({ seed: 1 });
+let model = null;            // last answered decision, for the bars
+let busy = false;            // a transcribe+route round trip is in flight
+let lastTranscript = "";     // what we last heard, kept so laya can re-read it
+
+// ---- drawing -----------------------------------------------------------------
+//
+// No image assets, on purpose: the repo commits none, and a penguin is four ellipses and
+// a triangle. Everything is drawn from the sim's numbers, so what is on screen cannot
+// disagree with what the tests assert — the sprite reads `sim.view`, which is derived
+// from `sim.col/row/heading`.
+
+const ICE_LIGHT = "#e8f2fb", ICE_DARK = "#dbe9f7";
+const WATER_FILL = "#1e3a5f", WATER_EDGE = "#2c5282";
+const FISH_BODY = "#f97316", FISH_FIN = "#fb923c";
+const BODY = "#22303c", BELLY = "#f8fafc", BEAK = "#f59e0b", FOOT = "#f59e0b";
+
+function drawFloe() {
+  // Ice tiles, with a faint checker so motion across a cell is visible.
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      ctx.fillStyle = (c + r) % 2 === 0 ? ICE_LIGHT : ICE_DARK;
+      ctx.fillRect(c * CELL, r * CELL, CELL, CELL);
+    }
+  }
+  // The floe's edge: a white rim, so "the edge of the floe" has a look as well as a name.
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 4;
+  ctx.strokeRect(2, 2, W - 4, H - 4);
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawWater() {
+  for (const w of sim.water) {
+    const x = w.col * CELL, y = w.row * CELL;
+    ctx.fillStyle = WATER_FILL;
+    roundRect(x + 3, y + 3, CELL - 6, CELL - 6, 12);
+    ctx.fill();
+    ctx.strokeStyle = WATER_EDGE;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // A highlight, so it reads as a hole in ice rather than a dark tile.
+    ctx.strokeStyle = "rgba(255,255,255,0.25)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(x + CELL * 0.42, y + CELL * 0.42, CELL * 0.16, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
+function drawFish() {
+  const t = performance.now() / 1000;
+  for (const f of sim.fish) {
+    const cx = f.col * CELL + CELL / 2, cy = f.row * CELL + CELL / 2;
+    const bob = Math.sin(t * 2 + f.col + f.row) * 1.6;
+    ctx.save();
+    ctx.translate(cx, cy + bob);
+    // Tail
+    ctx.fillStyle = FISH_FIN;
+    ctx.beginPath();
+    ctx.moveTo(9, 0); ctx.lineTo(16, -6); ctx.lineTo(16, 6);
+    ctx.closePath(); ctx.fill();
+    // Body
+    ctx.fillStyle = FISH_BODY;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 10, 6.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Eye
+    ctx.fillStyle = "#1c2128";
+    ctx.beginPath();
+    ctx.arc(-4, -1.5, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+/**
+ * The penguin, drawn from `sim.view`.
+ *
+ * Drawn in a local frame where +x is the direction of travel, then the whole thing is
+ * rotated by the heading. Every part is placed relative to `R`, so the sprite scales with
+ * CELL and a change to the grid does not leave a tiny bird on a big tile.
+ *
+ * The readability problem this shape solves: at 40px, a black bird with a big white belly
+ * and white-ringed eyes reads as a blob with a face, because the eyes and the belly merge
+ * into one white mass. The fix is to keep the belly strictly inside the body silhouette
+ * and put the eyes on a small white face patch ON the head, with dark pupils — so the head
+ * is a distinct shape rather than a spot on a circle.
+ */
+function drawPenguin() {
+  const v = sim.view;
+  const t = performance.now() / 1000;
+
+  // After eating, a brief scale pop; after a blocked step, a shake. Both decay in the sim.
+  const scale = 1 + 0.18 * v.pulse;
+  const walking = v.anim && v.anim.kind === "walk";
+
+  ctx.save();
+  ctx.translate(v.x, v.y);
+  // The blocked-step shake is applied unrotated, so it reads as the bird being jolted
+  // rather than spinning.
+  if (v.shake > 0) ctx.translate(Math.sin(t * 60) * 3.5 * v.shake, 0);
+  ctx.rotate((v.headingDeg * Math.PI) / 180);
+
+  const R = CELL * 0.46;
+  const cycle = v.phase * Math.PI * 2;
+  // The waddle: only while walking, so a standing bird is still. Applied to everything
+  // below, which is what makes it read as a gait rather than a sliding image.
+  ctx.rotate(walking ? Math.sin(cycle) * 0.12 : 0);
+  ctx.scale(scale, scale);
+
+  // ---- feet, behind the body so only the toes show ------------------------------
+  // They alternate: one steps forward as the other drags. Drawn first because the body
+  // overlaps them.
+  const stride = walking ? Math.sin(cycle) * R * 0.34 : 0;
+  ctx.fillStyle = FOOT;
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.ellipse(-R * 0.30 + side * stride, side * R * 0.40,
+                R * 0.26, R * 0.16, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ---- flippers, behind the body ------------------------------------------------
+  const flap = walking ? Math.sin(cycle) * 0.55 : 0.18;
+  for (const side of [-1, 1]) {
+    ctx.save();
+    ctx.translate(-R * 0.05, side * R * 0.40);
+    ctx.rotate(side * flap);
+    ctx.fillStyle = BODY;
+    ctx.beginPath();
+    ctx.ellipse(0, side * R * 0.34, R * 0.22, R * 0.50, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ---- body: one egg, centred slightly back -------------------------------------
+  ctx.fillStyle = BODY;
+  ctx.beginPath();
+  ctx.ellipse(-R * 0.14, 0, R * 0.62, R * 0.78, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ---- belly: strictly INSIDE the body, and smaller than it ----------------------
+  // The margin matters. A belly that reaches the silhouette edge turns the whole bird
+  // white and the outline disappears.
+  ctx.fillStyle = BELLY;
+  ctx.beginPath();
+  ctx.ellipse(-R * 0.18, 0, R * 0.34, R * 0.50, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ---- head: a disc that overlaps the body's front -------------------------------
+  ctx.fillStyle = BODY;
+  ctx.beginPath();
+  ctx.arc(R * 0.36, 0, R * 0.42, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ---- face patch + eyes ---------------------------------------------------------
+  // The patch is what separates "head" from "body" at this size; the pupils sit on it.
+  ctx.fillStyle = BELLY;
+  ctx.beginPath();
+  ctx.ellipse(R * 0.46, 0, R * 0.25, R * 0.28, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  const blink = Math.sin(t * 1.3) > 0.985 ? 0.10 : 1;     // a slow, occasional blink
+  ctx.fillStyle = "#0f1720";
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.ellipse(R * 0.54, side * R * 0.13,
+                R * 0.085, R * 0.085 * blink, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ---- beak: the heading cue that survives at the smallest size ------------------
+  ctx.fillStyle = BEAK;
+  ctx.beginPath();
+  ctx.moveTo(R * 0.70, 0);
+  ctx.lineTo(R * 1.14, -R * 0.18);
+  ctx.lineTo(R * 1.14, R * 0.18);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.restore();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  drawFloe();
+  drawWater();
+  drawFish();
+  drawPenguin();
+}
+
+// ---- the frame loop ---------------------------------------------------------
+
+let lastFrame = 0;
+function frame(t) {
+  const dt = lastFrame ? Math.min(0.05, (t - lastFrame) / 1000) : 0;
+  lastFrame = t;
+  if (dt > 0) step(sim, dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+// ---- the HUD ----------------------------------------------------------------
+
+const $ = id => document.getElementById(id);
+
+function renderHud() {
+  const m = measure(sim);
+  const total = sim.collected + sim.fish.length;
+  $("collected").textContent = sim.collected;
+  $("fishTotal").textContent = total;
+  $("stepsLeft").textContent = m.stepsLeft;
+  $("facing").textContent = m.heading;
+  const badge = $("doneBadge");
+  if (sim.done) {
+    badge.textContent = sim.doneReason === "all fish eaten" ? "ALL FISH EATEN 🎉" : "OUT OF STEPS";
+    badge.classList.add("on");
+  } else {
+    badge.classList.remove("on");
+  }
+}
+
+const BAR_ORDER = ["go", "back", "turn_left", "turn_right"];
+const BAR_LABEL = { go: "go", back: "back", turn_left: "left", turn_right: "right" };
+
+/**
+ * Render the four command bars. `probs` is optional — the rules reader has no
+ * distribution, so it passes the winning label only and the bars show a full-width
+ * winner. Showing a fake distribution would be worse than showing none.
+ */
+function renderBars(choice, probs, meta) {
+  const bars = $("decisionBars");
+  bars.innerHTML = "";
+  for (const label of BAR_ORDER) {
+    const hasDist = probs && typeof probs[label] === "number";
+    const value = hasDist ? probs[label] : (label === choice ? 1 : 0);
+    const pct = (value * 100).toFixed(1);
+    const row = document.createElement("div");
+    row.className = "bar" + (label === choice ? " winner" : "");
+    const suffix = label === choice ? (hasDist ? " ← model" : " ← rules") : "";
+    row.innerHTML =
+      `<div class="bar-label">${BAR_LABEL[label]}</div>` +
+      `<div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>` +
+      `<div class="bar-label">${hasDist ? pct + "%" : "—"}${suffix}</div>`;
+    bars.appendChild(row);
+  }
+  $("decisionMeta").textContent = meta;
+}
+
+function pushHistory(text) {
+  const history = $("history");
+  const entry = document.createElement("div");
+  entry.textContent = `${new Date().toLocaleTimeString()} — ${text}`;
+  history.prepend(entry);
+  while (history.children.length > 12) history.lastChild.remove();
+}
+
+// ---- carrying out a command --------------------------------------------------
+
+/** Apply one command and refresh everything that depends on the world. */
+function runCommand(cmd, source) {
+  if (sim.done) { renderHud(); return null; }
+  if (isAnimating(sim)) return null;         // one command at a time, matching the sim
+  const ev = applyCommand(sim, cmd);
+  if (!ev.accepted) return null;
+
+  let note;
+  if (ev.turned) note = `turned (now facing ${HEADINGS[sim.heading]})`;
+  else if (ev.blocked) note = `blocked — ${cmd === "go" ? "ahead" : "behind"} is not ice`;
+  else if (ev.ate) note = `ate a fish! (${ev.ate.total} so far)`;
+  else note = "moved";
+  $("lastMove").innerHTML = `<strong>${source}:</strong> ${describeCommand(cmd)} → ${note}`;
+  if (ev.done) pushHistory(`run over — ${ev.doneReason}`);
+
+  renderHud();
+  return ev;
+}
+
+// ---- the two readers ---------------------------------------------------------
+
+/**
+ * Route a transcript to a command.
+ *
+ * Two arms, and the difference is the demo. `rules` is the keyword table in
+ * penguin_commands.js — no model, no network, deterministic. Anything else POSTs the
+ * transcript plus the penguin's surroundings to /api/predict and reads the four-way
+ * answer. On any laya failure we fall back to the rules reader and SAY SO, rather than
+ * showing a spinner that never resolves or silently pretending the model answered.
+ */
+async function route(transcript) {
+  const chosen = $("model").value;
+
+  if (chosen === "rules") {
+    const p = parseCommand(transcript);
+    $("stateView").textContent = JSON.stringify(buildState(sim, transcript), null, 2);
+    renderBars(p.cmd, null,
+      p.cmd
+        ? `rules matched "${p.matched}"${p.ambiguous ? " · other commands also matched" : ""}`
+        : "rules found no command in that");
+    return p.cmd;
+  }
+
+  const state = buildState(sim, transcript);
+  $("stateView").textContent = JSON.stringify(state, null, 2);
+  try {
+    const response = await fetch("/api/predict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, questions: { command: QUESTION }, model: chosen }),
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      const detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      throw new Error(`${response.status}: ${detail}`);
+    }
+    const answer = body.result.answers.command;
+    renderBars(answer.choice, answer.probabilities || {},
+      `laya · confidence ${answer.confidence ?? "—"} · latency ${body.latency_ms} ms`);
+    if (parseCommand(transcript).ambiguous) {
+      pushHistory("the utterance named more than one command");
+    }
+    return answer.choice;
+  } catch (err) {
+    // Fall back loudly. A demo that goes quiet when the model is missing teaches nothing.
+    const p = parseCommand(transcript);
+    renderBars(p.cmd, null,
+      `laya failed (${err.message}) — fell back to rules`);
+    pushHistory(`laya unavailable: ${err.message}`);
+    return p.cmd;
+  }
+}
+
+/** The whole path: transcript -> command -> penguin. */
+async function hearAndObey(transcript) {
+  if (busy) return;
+  busy = true;
+  try {
+    lastTranscript = transcript;
+    $("transcript").textContent = transcript || "(nothing recognised)";
+    const cmd = await route(transcript);
+    if (!cmd) {
+      $("lastMove").innerHTML = `<span class="warn">no command in “${transcript}”</span>`;
+      return;
+    }
+    runCommand(cmd, "heard");
+  } finally {
+    busy = false;
+  }
+}
+
+// ---- microphone ---------------------------------------------------------------
+//
+// The capture path deliberately avoids MediaRecorder: it hands back a webm/opus blob in
+// Chrome and something else again in Safari, and decoding that server-side would mean
+// shipping ffmpeg. Instead we take raw Float32 from an AudioWorklet, resample to 16 kHz
+// mono with an OfflineAudioContext, and build a PCM WAV in JS. The server then only ever
+// sees one format, which the stdlib `wave` module reads — no audio dependency at all.
+
+const TARGET_RATE = 16000;
+const MAX_SECONDS = 25;
+
+let audioCtx = null, micStream = null, workletNode = null, sourceNode = null;
+let chunks = [], recording = false, recStarted = 0;
+
+async function ensureAudio() {
+  if (audioCtx) return audioCtx;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) throw new Error("this browser has no Web Audio support");
+  audioCtx = new Ctx();
+  // The worklet is inlined as a blob URL so the page stays a single file — the repo has
+  // no build step and no separate asset directory to put it in.
+  const src = `
+    class Tap extends AudioWorkletProcessor {
+      process(inputs) {
+        const ch = inputs[0] && inputs[0][0];
+        if (ch) this.port.postMessage(new Float32Array(ch));
+        return true;
+      }
+    }
+    registerProcessor("tap", Tap);
+  `;
+  const url = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
+  try {
+    await audioCtx.audioWorklet.addModule(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  return audioCtx;
+}
+
+async function startRecording() {
+  const ctxIn = await ensureAudio();
+  if (ctxIn.state === "suspended") await ctxIn.resume();
+
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+  });
+  sourceNode = ctxIn.createMediaStreamSource(micStream);
+  workletNode = new AudioWorkletNode(ctxIn, "tap");
+  chunks = [];
+  workletNode.port.onmessage = e => {
+    if (!recording) return;
+    chunks.push(e.data);
+    // Level meter, from the raw block.
+    let peak = 0;
+    for (let i = 0; i < e.data.length; i++) peak = Math.max(peak, Math.abs(e.data[i]));
+    $("level").style.width = `${Math.min(100, peak * 140)}%`;
+    // Auto-stop, so a forgotten click cannot record forever.
+    if ((ctxIn.currentTime - recStarted) > MAX_SECONDS) stopRecording();
+  };
+  sourceNode.connect(workletNode);
+  // A worklet with no destination can be optimised away in some browsers; a muted gain
+  // keeps it alive without echoing the mic back to the speakers.
+  const mute = ctxIn.createGain();
+  mute.gain.value = 0;
+  workletNode.connect(mute).connect(ctxIn.destination);
+
+  recording = true;
+  recStarted = ctxIn.currentTime;
+  $("micBtn").classList.add("rec");
+  $("micBtn").textContent = "⏺ Listening… click to stop";
+  $("asrMeta").textContent = "";
+}
+
+/** Resample the captured Float32 to 16 kHz mono and wrap it as a PCM WAV. */
+async function encodeWav(float32, inputRate) {
+  const outLength = Math.round((float32.length * TARGET_RATE) / inputRate);
+  // OfflineAudioContext does a proper resample rather than dropping samples. This is the
+  // whole reason the server needs no audio library.
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const off = new OfflineCtx(1, outLength, TARGET_RATE);
+  const buf = off.createBuffer(1, float32.length, inputRate);
+  buf.copyToChannel(float32, 0);
+  const src = off.createBufferSource();
+  src.buffer = buf;
+  src.connect(off.destination);
+  src.start();
+  const rendered = await off.startRendering();
+  const samples = rendered.getChannelData(0);
+
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const str = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  str(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  str(8, "WAVE");
+  str(12, "fmt ");
+  view.setUint32(16, 16, true);          // PCM header size
+  view.setUint16(20, 1, true);           // format = PCM
+  view.setUint16(22, 1, true);           // channels = mono
+  view.setUint32(24, TARGET_RATE, true);
+  view.setUint32(28, TARGET_RATE * 2, true);   // byte rate
+  view.setUint16(32, 2, true);           // block align
+  view.setUint16(34, 16, true);          // bits per sample
+  str(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([view], { type: "application/octet-stream" });
+}
+
+async function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  $("micBtn").classList.remove("rec");
+  $("micBtn").textContent = "🎤 Click to speak";
+  $("level").style.width = "0%";
+
+  const inputRate = audioCtx.sampleRate;
+  const captured = chunks;
+  chunks = [];
+
+  try { sourceNode?.disconnect(); } catch {}
+  try { workletNode?.disconnect(); } catch {}
+  micStream?.getTracks().forEach(t => t.stop());
+
+  if (!captured.length) {
+    $("asrMeta").textContent = "nothing was captured";
+    return;
+  }
+  // Concatenate the blocks into one buffer.
+  const total = captured.reduce((n, c) => n + c.length, 0);
+  const joined = new Float32Array(total);
+  let at = 0;
+  for (const c of captured) { joined.set(c, at); at += c.length; }
+
+  const seconds = total / inputRate;
+  if (seconds < 0.2) {
+    $("asrMeta").textContent = "that was too short to transcribe";
+    return;
+  }
+
+  $("asrMeta").textContent = "transcribing…";
+  try {
+    const wav = await encodeWav(joined, inputRate);
+    const lang = $("lang").value;
+    const response = await fetch(`/api/transcribe?lang=${encodeURIComponent(lang)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: wav,
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
+    $("asrMeta").textContent =
+      `${body.model} · ${body.duration_s}s audio · ${body.latency_ms} ms`;
+    await hearAndObey(body.transcript);
+    pushHistory(`heard “${body.transcript}”`);
+  } catch (err) {
+    $("asrMeta").innerHTML = `<span class="bad">transcription failed: ${err.message}</span>`;
+  }
+}
+
+async function toggleMic() {
+  if (recording) { await stopRecording(); return; }
+  try {
+    await startRecording();
+  } catch (err) {
+    // Permission denied is the common case and deserves a plain sentence, not a stack.
+    const msg = err?.name === "NotAllowedError"
+      ? "microphone permission denied — use the buttons or the keyboard instead"
+      : `could not start the microphone: ${err.message}`;
+    $("asrMeta").innerHTML = `<span class="bad">${msg}</span>`;
+    $("micBtn").classList.remove("rec");
+    $("micBtn").textContent = "🎤 Click to speak";
+  }
+}
+
+// ---- the Korean-through-laya caveat ------------------------------------------
+//
+// MEASURED, NOT ASSUMED. Asking laya to route a KOREAN transcript does not work: its
+// language detector reports Korean text as `script: latin`, so `auto` hands it to the
+// English checkpoint, and every Korean command comes back `go` — a confident wrong
+// answer rather than an error. The `multilingual` checkpoint is no better; it answers
+// `back` for all four. Both were checked directly against /api/predict.
+//
+// The honest response is to warn, not to hide it and not to silently disable the arm —
+// the Korean ASR itself is fine (moonshine-tiny-ko transcribes 앞으로 / 왼쪽으로 돌아
+// correctly), so the failure is entirely in the routing step and a reader should see that
+// for themselves.
+
+function updateLangNote() {
+  const ko = $("lang").value === "ko";
+  const usingModel = $("model").value !== "rules";
+  const note = $("langNote");
+  if (ko && usingModel) {
+    note.style.display = "block";
+    note.textContent =
+      "Heads up: laya misreads Korean as English and answers \"go\" for everything — " +
+      "the recognition is fine, the routing is not. Use the rules reader for Korean.";
+  } else {
+    note.style.display = "none";
+  }
+}
+
+// ---- wiring -----------------------------------------------------------------
+
+$("micBtn").addEventListener("click", toggleMic);
+$("lang").addEventListener("change", updateLangNote);
+$("model").addEventListener("change", updateLangNote);
+
+for (const btn of document.querySelectorAll(".cmds button")) {
+  btn.addEventListener("click", () => hearAndObey(btn.dataset.cmd.replace("_", " ")));
+}
+
+$("resetBtn").addEventListener("click", () => {
+  sim = createSim({ seed: Math.floor(Math.random() * 1e6),
+                    config: { maxSteps: Number($("budget").value) } });
+  $("history").innerHTML = "";
+  $("decisionBars").innerHTML = "";
+  $("stateView").textContent = "nothing yet";
+  $("transcript").innerHTML = '<span class="none">nothing heard yet</span>';
+  $("lastMove").textContent = "new floe — say something";
+  renderHud();
+});
+
+$("replayBtn").addEventListener("click", () => {
+  resetSim(sim);
+  $("history").innerHTML = "";
+  $("lastMove").textContent = "same floe, back to the start";
+  renderHud();
+});
+
+$("budget").addEventListener("input", e => {
+  $("budgetLabel").textContent = e.target.value;
+});
+
+// Keyboard fallback: no mic needed, and it makes a scenario replayable exactly.
+window.addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const tag = document.activeElement?.tagName;
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+  const map = {
+    g: "go", b: "back", l: "turn_left", r: "turn_right",
+    ArrowUp: "go", ArrowDown: "back", ArrowLeft: "turn_left", ArrowRight: "turn_right",
+  };
+  const cmd = map[e.key];
+  if (!cmd) return;
+  e.preventDefault();
+  hearAndObey(cmd.replace("_", " "));
+});
+
+// Expose the live sim, the same convention the other demos use.
+window.penguinSim = () => sim;
+
+// ---- boot ---------------------------------------------------------------------
+
+renderHud();
+updateLangNote();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
