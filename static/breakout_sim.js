@@ -419,10 +419,9 @@ export function buildState(sim) {
   //
   // ON — the prediction. The side is named from the wall-folded LANDING point (the
   // `ball-predicted-at-paddle-level` axiom's output — gap = landingX − paddleX, which is
-  // what the fix made it), and the two absolute x positions the gap was computed from are
-  // stated alongside. Coordinates WITHOUT the prose were measured separately and
-  // collapsed the score to a third (19.3 → 6.3): this model derives nothing from raw
-  // coordinates, so the prose stays and the coordinates are appended.
+  // what the fix made it), and the landing point is stated in the same sentence. It used
+  // to print the two absolute x positions instead; that was measured to collapse the local
+  // ciel head, so it now restates the gap as prose — see the landingLine comment below.
   const predicted = !!sim.config?.enforceReachability && m.landingX !== null;
   const sideOf = gap => gap > 15
     ? `clearly to the RIGHT of the paddle (gap ${gap.toFixed(0)} px)`
@@ -437,13 +436,30 @@ export function buildState(sim) {
     : m.timeToContact === null
       ? "already at paddle level"
       : `about ${m.timeToContact.toFixed(1)} seconds until the paddle can reach it`;
+  // The landing point, stated the way the head trained on it. The absolute
+  // coordinates this used to print ("It will land at x≈480, and the paddle is at
+  // x≈360") appear in NO training state — 0 occurrences of "will land at" and of
+  // "x≈" across the breakout JSONL, and the weakest match in an embedding screen
+  // (max-cos 0.772 against 4,280 trained field texts, nearest neighbour an
+  // unrelated "paddle.x: 480" leaf). The local ciel head answered it by collapsing
+  // to one class. `sideOf` restates the same number as the prose the renderer
+  // actually emits, which is what the head has a learned response for.
+  //
+  // The word "clearly" is load-bearing and is why this calls sideOf(m.gap) rather
+  // than reusing `side`: sideOf's centre branch says "offset", and this sentence
+  // needs its own lead-in.
   const landingLine = predicted
-    ? ` It will land at x≈${Math.round(m.landingX)}, and the paddle is at ` +
-      `x≈${Math.round(sim.paddleX)}.`
+    ? ` It will land ${sideOf(m.gap)}.`
     : "";
   return {
     situation: `The ball is ${side} and moving ${ball.vx > 0 ? "right" : "left"} and ` +
-      `${m.descending ? "down, falling toward the paddle" : "up, away from the paddle"}. ` +
+      // "Falling toward the paddle" is its own sentence in the renderer
+      // (states/breakout.py `_motion_echo`), never a clause of the geometry
+      // sentence. Merging it here put a phrase the head never saw in that
+      // position into the attended field, and it dominated the geometry: with
+      // the merged form the ciel head answered "left" for a ball plainly right
+      // of the paddle (right-prob 0.41 vs OK when the clause stands alone).
+      `${m.descending ? "down, toward the paddle. Falling toward the paddle" : "up, away from the paddle"}. ` +
       `${timeToPaddle.charAt(0).toUpperCase() + timeToPaddle.slice(1)}.${landingLine}`,
     // "Bricks remaining: X. Score: Y. Lives: Z." matches the ciel head's
     // training prose phrasing. (An earlier claim that the "N of M remain;

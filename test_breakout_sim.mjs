@@ -306,18 +306,24 @@ test("the two regimes disagree on this ball — and that disagreement is the dem
   assert.equal(m.gap, m.landingX - sim.paddleX);
   assert.match(buildState(sim).situation, /RIGHT/,
     "ontology ON: the observation follows the LANDING point — right of the paddle");
-  assert.match(buildState(sim).situation, /It will land at x≈197/);
+  // The landing sentence restates the landing SIDE, not the raw landingX: absolute
+  // coordinates appear in no training state (0 occurrences of "x≈" in the breakout
+  // JSONL) and collapsed the local ciel head to one class.
+  assert.match(buildState(sim).situation, /It will land clearly to the RIGHT of the paddle \(gap \d+ px\)/);
+  assert.doesNotMatch(buildState(sim).situation, /x≈/,
+    "absolute coordinates are gone — they are out of the head's training distribution");
   sim.config.enforceReachability = false;
   const off = buildState(sim).situation;
   assert.match(off, /LEFT/,
     "ontology OFF: the observation follows the CURRENT position — and says the wrong side");
-  assert.doesNotMatch(off, /It will land at/);
+  assert.doesNotMatch(off, /It will land/);
 });
 
-test("with the ontology on, the input gains the absolute coordinates the gap came from", () => {
+test("with the ontology on, the input states the landing side in the gap prose", () => {
   // ON: the side is named from the LANDING point (gap = landingX − paddleX, what the
-  // 12.4% fix made it) and the two absolute x positions are appended — coordinates
-  // WITHOUT the prose were measured at a threefold score collapse, so the prose stays.
+  // 12.4% fix made it) and the landing sentence restates that gap in the phrasing the
+  // renderer emits. It used to print the two absolute x positions; that form appears in
+  // no training state and collapsed the local ciel head, so it was replaced by prose.
   // OFF: the side is named from the ball's CURRENT position — the deliberate naive
   // baseline, which on this fixture names the opposite side.
   const sim = fresh({ ball: { x: 200, y: 200, vx: 200, vy: 160 } });
@@ -328,19 +334,42 @@ test("with the ontology on, the input gains the absolute coordinates the gap cam
   assert.notEqual(Math.sign(sim.ball.x - sim.paddleX), Math.sign(m.gap),
     "fixture is only meaningful while current and landing disagree");
   const on = buildState(sim).situation;
-  assert.match(on, /It will land at x≈/);
-  assert.match(on, new RegExp(`x≈${Math.round(m.landingX)}`),
-    "the stated coordinate must be the rollout's landing point");
-  assert.match(on, new RegExp(`paddle is at x≈${Math.round(sim.paddleX)}`),
-    "an absolute landing point without the paddle's own position is not actionable");
+  assert.match(on, /It will land /, "ON states where the ball will land");
+  assert.match(on, new RegExp(`gap ${Math.abs(Math.round(m.gap))} px`),
+    "the landing sentence restates the rollout's gap");
+  assert.doesNotMatch(on, /x≈/,
+    "no absolute coordinates: absent from training, and they collapsed the head");
   assert.match(on, /gap \d+ px/, "the gap prose survives — the model keys on it (measured)");
   assert.match(on, m.gap > 0 ? /RIGHT/ : /LEFT/, "ON names the landing side");
   sim.config.enforceReachability = false;
   const off = buildState(sim).situation;
   assert.match(off, /gap \d+ px/, "switch off: the prose shape survives");
-  assert.doesNotMatch(off, /It will land at/, "switch off: no prediction, no coordinates");
+  assert.doesNotMatch(off, /It will land/, "switch off: no prediction, no landing sentence");
   assert.match(off, sim.ball.x - sim.paddleX > 0 ? /RIGHT/ : /LEFT/,
     "OFF names the CURRENT side — the deliberate naive baseline");
+});
+
+test("the descent clause is a sentence, not a clause merged into the geometry", () => {
+  // The renderer emits "Falling toward the paddle." as its OWN sentence
+  // (states/breakout.py `_motion_echo`). Merging it into the geometry sentence
+  // ("...and down, falling toward the paddle") puts a phrase the head never saw in
+  // that position into the attended field, and it dominated the geometry: measured
+  // against the local decision_lab head, the merged form answered "left" for a ball
+  // plainly right of the paddle (right-prob 0.41, vs OK with the clause separated).
+  const sim = fresh({ ball: { x: 600, y: 200, vx: -200, vy: 160 } });
+  sim.paddleX = 100;
+  const m = measure(sim);
+  assert.equal(m.descending, true, "fixture must be a descending ball");
+  const on = buildState(sim).situation;
+  assert.match(on, /down, toward the paddle\. Falling toward the paddle\./,
+    "descent is stated as two sentences, matching the training prose");
+  assert.doesNotMatch(on, /down, falling/,
+    "the merged clause is what breaks the head — it must not come back");
+  // The rising case keeps its own single phrase (also verbatim from _motion_echo).
+  const rising = fresh({ ball: { x: 600, y: 200, vx: -200, vy: -160 } });
+  rising.paddleX = 100;
+  assert.equal(measure(rising).descending, false, "fixture must be a rising ball");
+  assert.match(buildState(rising).situation, /up, away from the paddle/);
 });
 
 test("the ON observation names the wrong side 0% of the time; the OFF baseline 12.4%", () => {
