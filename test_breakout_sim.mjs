@@ -14,7 +14,7 @@ import {
   W, H, ROWS, COLS, PADDLE_W, PADDLE_H, PADDLE_Y, PADDLE_SPEED, BALL_R,
   BRICK_H, BRICK_GAP, BRICK_TOP, CATCH_HALF, PADDLE_MIN, PADDLE_MAX,
   BALL_MIN_X, BALL_MAX_X, BAND_ENTER_Y, BAND_EXIT_Y, LAST_BRICK_BOTTOM,
-  CATCH_TOL_PX, DEFAULT_CONFIG, QUESTION,
+  CATCH_TOL_PX, DEFAULT_CONFIG, QUESTION, STAY_BAND_PX,
   createSim, startGame, resetBall, aliveBricks, setBallSpeed, step,
   measure, buildState, decidable, reflectX, rolloutReachable, buildLandingX, aimTarget,
 } from "./static/breakout_sim.js";
@@ -370,6 +370,49 @@ test("the descent clause is a sentence, not a clause merged into the geometry", 
   rising.paddleX = 100;
   assert.equal(measure(rising).descending, false, "fixture must be a rising ball");
   assert.match(buildState(rising).situation, /up, away from the paddle/);
+});
+
+test("a centered ball takes the renderer's CENTER path, not the side path", () => {
+  // states/breakout.py renders side == "center" differently in BOTH parts of the
+  // motion clause: _short_motion ("drifting left, falling") instead of
+  // _motion_phrase ("moving left and down, toward the paddle"), and
+  // _motion_echo(centre) == "The paddle is under the ball" instead of the
+  // toward/away clause. "moving left and down" occurs 0 times among the training
+  // center states, and the side path was measured to answer a centered ball
+  // "right" with stay-prob as low as 0.00; the center path answers "stay"
+  // throughout (0.88-0.94 over gaps 0..24).
+  // OFF regime, so the side reads straight from ball.x - paddleX and the fixture
+  // is exact. (Under ON the gap is the landing point, which this fixture does not
+  // try to control — the center path is reached in both regimes the same way.)
+  const sim = fresh({ ball: { x: 348, y: 200, vx: -40, vy: 160 } });
+  sim.paddleX = 350;                       // 2 px off: inside STAY_BAND_PX
+  sim.config.enforceReachability = false;
+  assert.ok(Math.abs(sim.ball.x - sim.paddleX) <= STAY_BAND_PX,
+    "fixture must be centered under the sim's own band");
+  const off = buildState(sim).situation;
+  assert.match(off, /almost directly above the paddle \(offset \d+ px\)/);
+  assert.match(off, /drifting left, falling/,
+    "centred uses the short motion words, not the side phrase");
+  assert.match(off, /The paddle is under the ball/,
+    "and the centre echo, which is what marks the ball as centered");
+  assert.doesNotMatch(off, /moving left and down/,
+    "the side motion phrase is what the head has no training for at center");
+});
+
+test("the centered band matches the training threshold, not a tighter one", () => {
+  // The head learned "stay" for gaps 0..24 (STAY_THRESHOLD_PX) and flips only
+  // past it — measured: stay-prob 0.90 at both 16 and 24, then 0.01 at 26. A
+  // narrower band would describe a 20 px gap as a side, which is both wrong to
+  // the head and prose the renderer never emits for that number.
+  assert.equal(STAY_BAND_PX, 24);
+  const sim = fresh({ ball: { x: 370, y: 200, vx: -40, vy: 160 } });
+  sim.paddleX = 350;                       // 20 px — inside the band
+  sim.config.enforceReachability = false;
+  assert.match(buildState(sim).situation, /almost directly above the paddle/,
+    "20 px is centered: inside the training band");
+  sim.ball = { x: 382, y: 200, vx: -40, vy: 160 };   // 32 px — past it
+  assert.match(buildState(sim).situation, /clearly to the RIGHT of the paddle/,
+    "32 px is a side: the training band ends before it");
 });
 
 test("the ON observation names the wrong side 0% of the time; the OFF baseline 12.4%", () => {

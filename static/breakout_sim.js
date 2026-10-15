@@ -22,6 +22,13 @@ export const BRICK_W = (W - 2 * BRICK_GAP) / COLS - BRICK_GAP;
 export const PADDLE_W = 70, PADDLE_H = 10, PADDLE_Y = H - 24;
 export const PADDLE_SPEED = 200;           // px/s, same in both modes
 export const BALL_R = 5;
+// |gap| at or under this reads as "centered". Mirrors the ciel head's training
+// renderer (states/breakout.py STAY_THRESHOLD_PX = 24 — that dataset's gold is
+// "stay" for gaps 0..24 and a side from 32 up). The observation is prose for a
+// head trained on that data, so the band has to match it: the head answers
+// "stay" across 0..24 and flips only past it, and describing a 20 px gap as
+// "clearly to the RIGHT" is phrasing the renderer never emits.
+export const STAY_BAND_PX = 24;
 export const ROW_COLORS = ["#f87171", "#fb923c", "#facc15", "#4ade80", "#60a5fa"];
 
 // Derived geometry, named once because three separate things need them and two of those
@@ -423,14 +430,17 @@ export function buildState(sim) {
   // to print the two absolute x positions instead; that was measured to collapse the local
   // ciel head, so it now restates the gap as prose — see the landingLine comment below.
   const predicted = !!sim.config?.enforceReachability && m.landingX !== null;
-  const sideOf = gap => gap > 15
+  // Threshold is STAY_BAND_PX (the training renderer's value), not an arbitrary 15.
+  const sideOf = gap => gap > STAY_BAND_PX
     ? `clearly to the RIGHT of the paddle (gap ${gap.toFixed(0)} px)`
-    : gap < -15
+    : gap < -STAY_BAND_PX
       ? `clearly to the LEFT of the paddle (gap ${Math.abs(gap).toFixed(0)} px)`
       : `almost directly above the paddle (offset ${Math.abs(gap).toFixed(0)} px)`;
   // When no prediction exists the only side there is, is the current one — that part is
   // not a regime difference, it is the undecidable band saying so.
-  const side = sideOf(predicted ? m.gap : ball.x - sim.paddleX);
+  const gapUsed = predicted ? m.gap : ball.x - sim.paddleX;
+  const side = sideOf(gapUsed);
+  const centered = Math.abs(gapUsed) <= STAY_BAND_PX;
   const timeToPaddle = !m.descending
     ? "rising away from the paddle"
     : m.timeToContact === null
@@ -451,15 +461,36 @@ export function buildState(sim) {
   const landingLine = predicted
     ? ` It will land ${sideOf(m.gap)}.`
     : "";
-  return {
-    situation: `The ball is ${side} and moving ${ball.vx > 0 ? "right" : "left"} and ` +
+  // Centered balls take the renderer's CENTER path, which differs from the side
+  // path in both parts of the motion clause:
+  //   motion — _short_motion ("drifting left, falling"), NOT _motion_phrase
+  //            ("moving left and down, toward the paddle"). "moving left and
+  //            down" occurs 0 times among the training center states.
+  //   echo   — _motion_echo(centre) is "The paddle is under the ball"; the side
+  //            path would append "up, away from the paddle" instead.
+  // Verified against the local ciel head over gaps 0..24: the side path was
+  // answered "right" for half the centered balls (stay-prob as low as 0.00),
+  // the center path "stay" throughout (0.88-0.94).
+  const shortMotion = () => {
+    const parts = [];
+    if (ball.vx > 0) parts.push("drifting right");
+    else if (ball.vx < 0) parts.push("drifting left");
+    if (m.descending) parts.push("falling");
+    else parts.push("rising");
+    return parts.join(", ");
+  };
+  const motionClause = centered
+    ? `${shortMotion()}. The paddle is under the ball`
+    : "moving " + (ball.vx > 0 ? "right" : "left") + " and " +
       // "Falling toward the paddle" is its own sentence in the renderer
       // (states/breakout.py `_motion_echo`), never a clause of the geometry
       // sentence. Merging it here put a phrase the head never saw in that
       // position into the attended field, and it dominated the geometry: with
       // the merged form the ciel head answered "left" for a ball plainly right
       // of the paddle (right-prob 0.41 vs OK when the clause stands alone).
-      `${m.descending ? "down, toward the paddle. Falling toward the paddle" : "up, away from the paddle"}. ` +
+      `${m.descending ? "down, toward the paddle. Falling toward the paddle" : "up, away from the paddle"}`;
+  return {
+    situation: `The ball is ${side} and ${motionClause}. ` +
       `${timeToPaddle.charAt(0).toUpperCase() + timeToPaddle.slice(1)}.${landingLine}`,
     // "Bricks remaining: X. Score: Y. Lives: Z." matches the ciel head's
     // training prose phrasing. (An earlier claim that the "N of M remain;
