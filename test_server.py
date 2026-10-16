@@ -692,3 +692,12 @@ def test_a_truncated_wav_body_returns_400_not_500(client):
     )
     assert response.status_code == 400, response.text
     assert "not a readable WAV" in response.json()["detail"]
+
+
+def test_decision_lab_page_is_served():
+    """The embedded Decision Lab page rides the catch-all static mount, so a typo in its
+    filename (or dropping it from static/) would only show up in a browser. Check it is
+    reachable and still carries the iframe the page is built around."""
+    response = TestClient(server_module.app).get("/decision_lab.html")
+    assert response.status_code == 200, response.text
+    assert 'id="lab"' in response.text
