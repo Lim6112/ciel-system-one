@@ -11,6 +11,10 @@ Run with: uv run uvicorn server:app
 typed-question interface and its answer shape (see jev.py), so this endpoint's contract
 and every client are unchanged — the only visible differences are latency, a reported
 cost, and the absence of laya's `act_probability`.
+
+A same-origin relay of Decision Lab's own UI lives here too (`/lab`), because that page
+is the only one of these that has to reach another service *from the browser* — which it
+cannot do across origins. See decision_lab_proxy.py for why that is the whole problem.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -33,6 +38,8 @@ import jev
 import ciel
 
 import asr
+
+import decision_lab_proxy
 
 QuestionType = Literal["choice", "score", "noul"]
 ModelOverride = Literal[
@@ -249,6 +256,72 @@ async def transcribe_audio(
 
     result["latency_ms"] = round((time.perf_counter() - start) * 1000, 1)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Decision Lab's labeling UI, relayed same-origin
+# ---------------------------------------------------------------------------
+
+
+async def _relay(request: Request, upstream_path: str, rewrite_html: bool = False) -> Response:
+    """Forward one request to Decision Lab and hand its answer back.
+
+    The body is read here — a streamed upload cannot be pushed to a worker thread
+    after the response starts — while the relay itself runs in the threadpool: it
+    is blocking socket I/O on an async endpoint.
+    """
+    body = await request.body()
+    headers = decision_lab_proxy.forwardable_headers(request.headers)
+    try:
+        relayed = await run_in_threadpool(
+            decision_lab_proxy.relay,
+            request.method,
+            upstream_path,
+            request.url.query,
+            headers,
+            body or None,
+            rewrite_html,
+        )
+    except decision_lab_proxy.RelayError as exc:
+        # 502 rather than 500, on the same reasoning as the jev and ciel branches:
+        # the caller's request was fine, the thing behind it was not.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if relayed.content_type and relayed.content_type.startswith("text/event-stream"):
+        # Relayed chunk by chunk: the labeling UI's progress events are only worth
+        # anything if they arrive while the batch is still running.
+        return StreamingResponse(
+            relayed.body,
+            status_code=relayed.status,
+            media_type=relayed.content_type,
+            headers={"X-Accel-Buffering": "no"},
+        )
+    return Response(
+        content=b"".join(relayed.body),
+        status_code=relayed.status,
+        headers={"content-type": relayed.content_type} if relayed.content_type else None,
+    )
+
+
+# Both spellings, because the frame's own reload and a hand-typed URL disagree about
+# the trailing slash. Registered before the catch-all mount below, so /lab is ours.
+@app.get(decision_lab_proxy.PREFIX, include_in_schema=False)
+@app.get(f"{decision_lab_proxy.PREFIX}/", include_in_schema=False)
+async def decision_lab_ui(request: Request) -> Response:
+    """The service's UI itself, opened on its Label view by the relay module."""
+    return await _relay(request, "/", rewrite_html=True)
+
+
+@app.api_route(
+    f"{decision_lab_proxy.PREFIX}/{{path:path}}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    include_in_schema=False,
+)
+async def decision_lab_asset(path: str, request: Request) -> Response:
+    """Everything else the service serves: its API (including the SSE stream) and its
+    static files. Like the jev, ciel and asr branches, this uses no laya router — so it
+    takes no predict_lock and does not 503 while that router is still loading."""
+    return await _relay(request, f"/{path}")
 
 
 @app.get("/api/health")

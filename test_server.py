@@ -5,11 +5,14 @@ uv run pytest test_server.py
 
 from __future__ import annotations
 
+import io
 import time
+import urllib.error
 
 import pytest
 from fastapi.testclient import TestClient
 
+import decision_lab_proxy
 import server as server_module
 
 
@@ -701,3 +704,215 @@ def test_decision_lab_page_is_served():
     response = TestClient(server_module.app).get("/decision_lab.html")
     assert response.status_code == 200, response.text
     assert 'id="lab"' in response.text
+    # Same-origin through the /lab relay, never the service's own port: that address
+    # is exactly what a browser elsewhere cannot reach, and reaching it from an https
+    # page would be blocked anyway.
+    assert "location.origin}/lab" in response.text
+    assert ":8000" not in response.text
+
+
+# ---- /lab relay (Decision Lab's UI, served same-origin) -----------------------
+# These stub the relay's single network seam, so the suite needs neither the
+# service nor a browser.
+
+
+def _relay_response(body: bytes, content_type: str | None = "application/json", status: int = 200):
+    """A stand-in for urlopen's return value, read in chunks like the real one."""
+
+    class FakeResponse:
+        def __init__(self):
+            self.status = status
+            self.headers = {"content-type": content_type} if content_type else {}
+            self._body = io.BytesIO(body)
+
+        def read(self, size: int = -1) -> bytes:
+            return self._body.read(size)
+
+        def close(self) -> None:
+            pass
+
+    return FakeResponse()
+
+
+@pytest.fixture()
+def lab(monkeypatch):
+    """Stub the relay's network seam and record what it was asked to send."""
+    calls = []
+    state = {"response": _relay_response(b'{"ready":true}')}
+
+    def fake_open(request, timeout):
+        calls.append({
+            "url": request.full_url,
+            "method": request.get_method(),
+            "headers": {name.lower(): value for name, value in request.header_items()},
+            "body": request.data,
+            "timeout": timeout,
+        })
+        if isinstance(state["response"], Exception):
+            raise state["response"]
+        return state["response"]
+
+    monkeypatch.setattr(decision_lab_proxy, "_open", fake_open)
+    return calls, state
+
+
+def test_lab_relays_status_to_the_configured_service(client, lab):
+    """The page asks this server; this server asks the service. Same address reader as
+    the ciel adapter, so the UI and the predictions cannot disagree about where the
+    head lives."""
+    calls, _ = lab
+    test_client, _ = client
+    response = test_client.get("/lab/api/status")
+    assert response.status_code == 200
+    assert response.json() == {"ready": True}
+    assert calls[0]["url"] == f"{server_module.ciel.base_url()}/api/status"
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_lab_forwards_the_query_string(client, lab):
+    calls, _ = lab
+    test_client, _ = client
+    test_client.get("/lab/api/label/queue?include_labeled=1")
+    assert calls[0]["url"].endswith("/api/label/queue?include_labeled=1")
+
+
+def test_lab_forwards_a_post_body_and_the_traffic_capture_opt_in(client, lab):
+    """X-Decision-Lab-Log is what turns a call into training data, so the relay must
+    carry it through rather than eating it as an unknown header."""
+    calls, _ = lab
+    test_client, _ = client
+    test_client.post(
+        "/lab/api/label",
+        json={"item_id": "i1", "gold_idx": 1, "source": "accepted"},
+        headers={"X-Decision-Lab-Log": "1"},
+    )
+    assert calls[0]["headers"]["x-decision-lab-log"] == "1"
+    assert calls[0]["method"] == "POST"
+    assert b"item_id" in calls[0]["body"]
+
+
+def test_lab_drops_the_headers_the_transport_owns(client, lab):
+    """REGRESSION-shaped: forwarding Host would point the upstream request at *this*
+    server, and a forwarded Content-Length would contradict the body urllib sends.
+    accept-encoding goes too — bodies are relayed verbatim, so a gzip response would
+    arrive without the header needed to decode it."""
+    calls, _ = lab
+    test_client, _ = client
+    test_client.post(
+        "/lab/api/label", content=b"{}",
+        headers={"content-type": "application/json", "accept-encoding": "gzip, deflate"},
+    )
+    assert "host" not in calls[0]["headers"]
+    assert "content-length" not in calls[0]["headers"]
+    assert "accept-encoding" not in calls[0]["headers"]
+    assert calls[0]["headers"]["content-type"] == "application/json"
+
+
+def test_lab_passes_an_upstream_error_through_unchanged(client, lab):
+    """The service's own 4xx is information the labeling UI shows verbatim. Turning it
+    into a relay error would replace \"no pending items to label\" with a shrug."""
+    calls, state = lab
+    state["response"] = urllib.error.HTTPError(
+        "http://127.0.0.1:8000/api/label/auto", 400, "Bad Request", {},
+        io.BytesIO(b'{"detail":"no pending items to label"}'),
+    )
+    test_client, _ = client
+    response = test_client.post("/lab/api/label/auto", json={})
+    assert response.status_code == 400
+    assert "no pending items to label" in response.text
+
+
+def test_lab_maps_an_unreachable_service_to_a_502_naming_the_address(client, lab):
+    """502, not 500: the caller's request was fine, the thing behind it was not. The
+    address is in the detail because that is the one fact that makes it fixable."""
+    calls, state = lab
+    state["response"] = urllib.error.URLError(ConnectionRefusedError("Connection refused"))
+    test_client, _ = client
+    response = test_client.get("/lab/api/status")
+    assert response.status_code == 502
+    assert server_module.ciel.base_url() in response.json()["detail"]
+
+
+def test_lab_streams_the_auto_label_batch_for_real(client, lab):
+    """One progress event per labeled item is only worth anything if it arrives while
+    the batch is still running, so an SSE response must not be buffered."""
+    calls, state = lab
+    state["response"] = _relay_response(
+        b'event: progress\ndata: {"ok": true}\n\n', content_type="text/event-stream",
+    )
+    test_client, _ = client
+    response = test_client.get("/lab/api/label/auto-all")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: progress" in response.text
+    assert response.headers.get("x-accel-buffering") == "no"
+
+
+def test_lab_relays_the_pages_own_assets(client, lab):
+    """The embedded UI loads its CSS and JS from the service. Without those coming
+    through too, the frame arrives unstyled and inert."""
+    calls, state = lab
+    state["response"] = _relay_response(b".tab{color:red}", content_type="text/css")
+    test_client, _ = client
+    response = test_client.get("/lab/static/style.css")
+    assert response.status_code == 200
+    assert calls[0]["url"].endswith("/static/style.css")
+    assert response.headers["content-type"].startswith("text/css")
+
+
+def test_lab_opens_the_label_view_without_touching_the_upstream_checkout(client, lab):
+    """The page is embedded on its Label view. Doing that rewrite in the relay keeps
+    this repo the only place that knows about it, so an upstream checkout whose app.js
+    predates `?tab=` still lands on the view this page exists to show."""
+    calls, state = lab
+    state["response"] = _relay_response(
+        b"<html><head><title>Decision Lab</title></head><body></body></html>",
+        content_type="text/html; charset=utf-8",
+    )
+    test_client, _ = client
+    response = test_client.get("/lab/")
+    assert response.status_code == 200
+    assert 'set("tab", "label")' in response.text
+    assert calls[0]["url"].endswith("/")
+    # The upstream UI is light-styled; without this a dark-mode browser paints its
+    # controls dark against its own light background.
+    assert "<style>:root{color-scheme:light}</style>" in response.text
+
+
+def test_lab_leaves_an_explicit_view_alone(client, lab):
+    """The injected script checks before rewriting, and so does the relay — a redirect
+    on every load would be a reload loop."""
+    calls, state = lab
+    state["response"] = _relay_response(b"<head></head>", content_type="text/html")
+    test_client, _ = client
+    response = test_client.get("/lab/?tab=eval")
+    assert 'set("tab", "label")' not in response.text
+
+
+def test_lab_does_not_rewrite_a_page_that_cannot_take_it(client, lab):
+    """A body with no head is returned untouched: a working page beats a \"rewritten\"
+    one whose scripts never ran."""
+    calls, state = lab
+    state["response"] = _relay_response(b"<html>no head here</html>", content_type="text/html")
+    test_client, _ = client
+    assert test_client.get("/lab/").text == "<html>no head here</html>"
+
+
+def test_lab_ui_answers_with_and_without_a_trailing_slash(client, lab):
+    """Both spellings, and neither by redirect: the frame's own reload and a hand-typed
+    URL disagree about the slash, and a redirect inside a frame is a needless flash."""
+    calls, state = lab
+    state["response"] = _relay_response(b"<head></head>", content_type="text/html")
+    test_client, _ = client
+    for url in ("/lab", "/lab/"):
+        response = test_client.get(url, follow_redirects=False)
+        assert response.status_code == 200, f"{url} did not serve directly"
+
+
+def test_lab_works_while_the_laya_router_is_cold(client, lab, monkeypatch):
+    """Labeling must not wait on the local model — the same property jev, ciel and
+    /api/transcribe have, and the reason this takes no predict_lock either."""
+    calls, _ = lab
+    test_client, _ = client
+    monkeypatch.setattr(server_module._RouterState, "router", None)
+    assert test_client.get("/lab/api/status").status_code == 200

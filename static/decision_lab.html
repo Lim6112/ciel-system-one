@@ -7,8 +7,8 @@
 <style>
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --border: #d9dde3; --text: #1c2128;
-    --muted: #6b7280; --accent: #4f46e5; --accent-soft: #eef2ff;
-    --danger: #b91c1c; --danger-bg: #fef2f2; --ok: #047857;
+    --muted: #6b7280; --accent: #4f46e5;
+    --danger: #b91c1c; --ok: #047857;
   }
   * { box-sizing: border-box; }
   body {
@@ -51,28 +51,22 @@
   .stage { flex: 1 1 auto; min-height: 0; padding: 14px 24px; }
   iframe {
     display: block; width: 100%; height: 100%; border: 1px solid var(--border);
-    border-radius: 10px; background: var(--panel);
+    border-radius: 10px;
+    /* An explicit white, not var(--panel): the embedded UI is a light theme of its
+       own, and a blank frame should not flash this page's background. */
+    background: #fff;
   }
-  .hint { background: var(--panel); border: 1px solid var(--border);
-    border-radius: 10px; padding: 18px 20px; max-width: 660px; }
-  .hint h2 { margin: 0 0 8px; font-size: 15px; color: var(--danger); }
-  .hint p { margin: 0 0 10px; }
-  .hint code { background: var(--accent-soft); color: var(--accent);
-    padding: 1px 5px; border-radius: 4px; font-size: 13px; }
-  .hint pre { margin: 0 0 10px; padding: 10px 12px; overflow-x: auto;
-    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
-  .hint .muted { color: var(--muted); font-size: 13px; margin: 0; }
-  .hidden { display: none !important; }
 </style>
 </head>
 <body>
 <header>
   <h1>CJet's decision model 🧪</h1>
   <p>The trained dynamic decision head (<code>ciel_decision_model_v1</code>) runs as its own
-     local service — this page embeds that service's UI, opened on its
+     local service. This page embeds that service's own UI, opened on its
      <strong>Label</strong> view, where captured real traffic gets labeled and turned into
-     training data. <a href="/">← back to the main UI</a></p>
+     training data. It is served through this app's <code>/lab</code> relay, so the browser
+     never has to reach the service's port itself.
+     <a href="/">← back to the main UI</a></p>
 </header>
 
 <div class="toolbar">
@@ -85,35 +79,22 @@
 
 <div class="stage">
   <iframe id="lab" title="Decision Lab" referrerpolicy="no-referrer"></iframe>
-  <div id="hint" class="hint hidden">
-    <h2>Decision Lab is not reachable</h2>
-    <p>Nothing answered on <code id="hintUrl"></code>. Start the service in its own checkout:</p>
-    <pre>cd decision-qwen-decision-head-casual-model
-uv run python -m decision_lab ui</pre>
-    <p>Both servers default to port 8000, so run CJet on another one:</p>
-    <pre>uv run uvicorn server:app --port 8001</pre>
-    <p class="muted">Point <strong>Source</strong> above at a different host/port if the service
-       runs elsewhere — <code>ciel.py</code> reads the same address from
-       <code>DECISION_LAB_URL</code>.</p>
-  </div>
 </div>
 
 <script>
 "use strict";
 
-// laya's `ciel.py` reaches the same service through DECISION_LAB_URL, which defaults
-// to 127.0.0.1:8000. The default here matches it, except that a browser opened from
-// another machine would have 127.0.0.1 mean *its own* loopback — so the hostname is
-// borrowed from the page and only the port is fixed.
-const DEFAULT_URL = `${location.protocol}//${location.hostname || "127.0.0.1"}:8000`;
+// Same-origin by default: this app relays /lab to the Decision Lab service (see
+// decision_lab_proxy.py), which is what lets the page work from any browser — the
+// service binds loopback only, its port is firewalled, and an https page is not
+// allowed to frame a plain-http origin in the first place.
+const DEFAULT_URL = `${location.origin}/lab`;
 
 const els = {
   source: document.getElementById("source"),
   reload: document.getElementById("reload"),
   open: document.getElementById("open"),
   frame: document.getElementById("lab"),
-  hint: document.getElementById("hint"),
-  hintUrl: document.getElementById("hintUrl"),
   dot: document.getElementById("dot"),
   statusText: document.getElementById("statusText"),
 };
@@ -121,27 +102,35 @@ const els = {
 // `?url=` wins, so one file covers a service on another host without a rebuild.
 function initialUrl() {
   const raw = new URLSearchParams(location.search).get("url");
-  if (!raw) return DEFAULT_URL;
-  try {
-    return new URL(raw).origin;
-  } catch {
-    return DEFAULT_URL;
-  }
+  return raw ? normalize(raw) : DEFAULT_URL;
 }
 
+/**
+ * Resolve what the user typed into a base URL for the frame.
+ *
+ * A leading "/" is a path on this origin — that is how the relay default is
+ * written. Otherwise the value is a base URL, and any path is kept (an origin
+ * with a /lab relay is a legitimate target); a bare origin keeps only its origin,
+ * so it still means "the service, at its root" the way it always has. Bare
+ * "host:port" is tolerated the way a user would type it.
+ */
 function normalize(value) {
-  const trimmed = (value || "").trim().replace(/\/+$/, "");
-  if (!trimmed) return DEFAULT_URL;
+  const raw = (value || "").trim();
+  if (!raw) return DEFAULT_URL;
+  if (raw.startsWith("/")) return location.origin + raw.replace(/\/+$/, "");
   try {
-    // Tolerate a bare "host:port" the way a user would type it.
-    return new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`).origin;
+    const url = new URL(/^https?:\/\//i.test(raw) ? raw : `http://${raw}`);
+    const path = url.pathname === "/" ? "" : url.pathname.replace(/\/+$/, "");
+    return url.origin + path;
   } catch {
     return DEFAULT_URL;
   }
 }
 
-// The service's own UI, on its Label view (`?tab=` is honored by app.js). A service
-// that predates that param still loads — it just opens on its default view.
+// The service's own UI, on its Label view. The relay rewrites the page it serves
+// to add `tab=label` when it is missing, so this holds even against a checkout
+// whose app.js predates that param; a service trained elsewhere still loads, just
+// on its default view.
 function frameSrc(base) {
   return `${base}/?tab=label`;
 }
@@ -152,27 +141,30 @@ let pollTimer = null;
 function setStatus(kind, text) {
   els.dot.className = `dot ${kind}`;
   els.statusText.textContent = text;
+  // Upstream failures are wordier than the toolbar wants; the full text stays
+  // reachable on hover rather than being cut off or wrapped.
+  els.statusText.title = text;
 }
 
 /**
- * Ask the service whether it is up. `/api/status` is exactly what `ciel.health()`
- * reads, but reading the body needs CORS, which decision_lab does not enable — so a
- * cross-origin probe is sent in no-cors mode and can only report reachability. That
- * difference is surfaced in the text rather than papered over.
+ * Ask the service whether it is up — the same `/api/status` `ciel.health()` reads,
+ * through the relay, so the answer means the same thing on both sides.
+ *
+ * The relay answers 502 with the upstream reason when nothing is listening, which
+ * is why a failed probe reports a reason rather than a bare "no".
  */
 async function probe(base) {
-  const url = `${base}/api/status`;
-  const sameOrigin = new URL(url).origin === location.origin;
   try {
-    const response = await fetch(url, sameOrigin
-      ? { cache: "no-store" }
-      : { mode: "no-cors", cache: "no-store" });
-    if (!sameOrigin) return "reachable";
-    if (!response.ok) return "unreachable";
+    const response = await fetch(`${base}/api/status`, { cache: "no-store" });
     const body = await response.json().catch(() => null);
-    return body && body.ready === true ? "ready" : "loading";
+    if (!response.ok) {
+      return { kind: "bad", text: (body && body.detail) || `HTTP ${response.status}` };
+    }
+    return body && body.ready === true
+      ? { kind: "ok", text: "ready" }
+      : { kind: "wait", text: "still loading its head…" };
   } catch {
-    return "unreachable";
+    return { kind: "bad", text: "not reachable" };
   }
 }
 
@@ -183,23 +175,17 @@ function stopPolling() {
 }
 
 async function check() {
-  const state = await probe(current);
-  if (state === "unreachable") {
-    setStatus("bad", "not reachable");
-    els.hintUrl.textContent = current;
-    els.hint.classList.remove("hidden");
-    els.frame.classList.add("hidden");
-    // Keep checking: the user is probably about to start the service, and this page
-    // should come alive on its own rather than needing a reload.
-    if (pollTimer === null) pollTimer = setInterval(check, 5000);
+  const { kind, text } = await probe(current);
+  setStatus(kind, text.slice(0, 160));
+  if (kind === "ok") {
+    stopPolling();
     return;
   }
-  stopPolling();
-  els.hint.classList.add("hidden");
-  els.frame.classList.remove("hidden");
-  if (state === "ready") setStatus("ok", "ready");
-  else if (state === "loading") setStatus("wait", "still loading its head…");
-  else setStatus("wait", "reachable (cross-origin — status unknown)");
+  // Keep checking while it is not ready: the user is probably about to start the
+  // service, and this page should come alive on its own rather than needing a
+  // reload. "still loading its head…" polls for the same reason — it is a state
+  // that becomes ready without anyone touching this page.
+  if (pollTimer === null) pollTimer = setInterval(check, 5000);
 }
 
 function load(base) {
@@ -207,7 +193,6 @@ function load(base) {
   els.source.value = base;
   els.open.href = base;
   els.frame.src = frameSrc(base);
-  els.hintUrl.textContent = base;
   stopPolling();
   setStatus("", "checking…");
   check();

@@ -416,8 +416,9 @@ curl -s http://127.0.0.1:8000/api/status      # {"ready":true} before use
 The adapter URL is configurable: `DECISION_LAB_URL` defaults to
 `http://127.0.0.1:8000`. Note the **port conflict**: `uv run uvicorn server:app`
 also defaults to 8000, so run one of them elsewhere — e.g.
-`uv run uvicorn server:app --port 8001`. Errors surface as HTTP 502 with the
-upstream body in `detail` (the service reports 503 while loading and 400 when
+`uv run uvicorn server:app --port 8001`. The same variable is what the `/lab` relay
+dials (below), via the same helper — so one setting moves both. Errors surface as HTTP 502
+with the upstream body in `detail` (the service reports 503 while loading and 400 when
 `models/head_dynamic.pt` is missing/untrained). State is sent as the bare field
 values space-joined into one line, in insertion order — the head was trained on
 prose, and "key: value"-style prefixes or newlines between fields measurably
@@ -442,19 +443,28 @@ uv run uvicorn server:app --port 8001                                           
 ```
 
 The page iframes the service and opens it on its **Label** view (`?tab=label`, which
-the service's `app.js` honors). Nothing is copied, so the two frontends cannot drift
-and no CORS work is needed — the embedded page's own fetches to :8000 stay within
-that origin. The **Source** field (or `?url=`) re-points the frame when the service
-runs elsewhere, matching what `DECISION_LAB_URL` tells `ciel.py`.
+the service's `app.js` honors). Nothing is copied, so the two frontends cannot drift.
 
-Two caveats worth knowing before it confuses you:
+**The frame is served same-origin, through this repo.** `server.py` relays `/lab` to
+the service (`decision_lab_proxy.py`), and **Source** defaults to that relay. This is
+the part that matters in practice: the service binds loopback and its port is
+firewalled, so a browser anywhere else cannot reach `:8000` directly — and when this
+app is served over HTTPS, framing a plain-HTTP origin is blocked outright regardless
+of the firewall. Relaying means the browser only ever talks to this server.
 
-- The **port conflict above applies here**: this page assumes the service owns 8000
-  and this repo is on 8001. Swapping them just means editing **Source**.
-- The reachability dot cannot read `/api/status` across origins (the service sets no
-  CORS headers), so a cross-origin probe reports *reachable* rather than *ready*.
-  It still catches the case it exists for — service not started — and says so instead
-  of showing a blank frame.
+The relay reads its destination from `ciel.base_url()`, the same reader `ciel.py`
+uses, so `DECISION_LAB_URL` moves both the adapter and the embedded UI together and
+they cannot disagree. Upstream errors pass through with their status and body, so the
+page shows the service's own message ("no pending items to label") rather than a
+generic failure; an unreachable service is a 502 naming the address it tried. Because
+the probe is now same-origin, the reachability dot reads `/api/status` for real and
+reports **ready**, not merely *reachable*.
+
+One caveat is left, and it is the **port conflict above**: the relay's default
+destination honors `DECISION_LAB_URL`, so a service running elsewhere needs that
+variable set (or **Source** / `?url=` pointing at its own `/lab`). A cross-origin
+**Source** is still subject to the browser's mixed-content rules — that is the
+browser's call and the relay does not pretend otherwise.
 
 #### Does it transfer? laya vs Jev
 
