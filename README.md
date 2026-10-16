@@ -427,6 +427,35 @@ bricks line and the centered case (`offset N px`) the way the training prose
 does, for the same reason. Choice options come from the criteria keys, score
 levels from the criteria list.
 
+#### Labeling that traffic — the service's own UI, embedded
+
+`ciel.py` asks the service to log every call it makes (`X-Decision-Lab-Log: 1`,
+`ciel.py:200`), and the service keeps those calls in `data/traffic/` when its own
+`web.log_traffic` is on. Labeling them is what turns real traffic into training
+data, and that labeling UI belongs to the service, not to this repo — so
+`static/decision_lab.html` **embeds** it rather than reimplementing it:
+
+```sh
+cd decision-qwen-decision-head-casual-model && uv run python -m decision_lab ui   # :8000
+uv run uvicorn server:app --port 8001                                            # this repo
+# open http://localhost:8001/decision_lab.html — or follow the 🧪 link on the main UI
+```
+
+The page iframes the service and opens it on its **Label** view (`?tab=label`, which
+the service's `app.js` honors). Nothing is copied, so the two frontends cannot drift
+and no CORS work is needed — the embedded page's own fetches to :8000 stay within
+that origin. The **Source** field (or `?url=`) re-points the frame when the service
+runs elsewhere, matching what `DECISION_LAB_URL` tells `ciel.py`.
+
+Two caveats worth knowing before it confuses you:
+
+- The **port conflict above applies here**: this page assumes the service owns 8000
+  and this repo is on 8001. Swapping them just means editing **Source**.
+- The reachability dot cannot read `/api/status` across origins (the service sets no
+  CORS headers), so a cross-origin probe reports *reachable* rather than *ready*.
+  It still catches the case it exists for — service not started — and says so instead
+  of showing a blank frame.
+
 #### Does it transfer? laya vs Jev
 
 Everything above rests on one model, and the obvious objection is that reading
