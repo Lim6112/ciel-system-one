@@ -39,6 +39,26 @@ SERVICE_NAME = "decision_lab/dynamic-head"
 URL_ENV = "DECISION_LAB_URL"
 DEFAULT_URL = "http://127.0.0.1:8000"
 DECIDE_PATH = "/api/decide-dynamic"
+# Sub-path selection. The service serves several heads off one backbone and
+# routes on the request's `path`; without this the request resolves to
+# web.default_path ("doc") and a problem's own head is unreachable — silently,
+# since the service only 400s on an *unknown* path, never a missing one.
+PATH_ENV = "DECISION_LAB_PATH"
+
+# Model overrides that select a problem-specific head rather than the doc bank.
+MODEL_PATHS = {"ciel_warehouse_v1": "warehouse"}
+
+
+def resolve_path(model: str | None = None) -> str | None:
+    """Sub-path for this call: explicit model mapping, then env, then None.
+
+    None means "let the service use web.default_path" — the behaviour every
+    existing caller got, so nothing that ran before this needs to change.
+    """
+    if model and model in MODEL_PATHS:
+        return MODEL_PATHS[model]
+    path = os.environ.get(PATH_ENV, "").strip()
+    return path or None
 # A local inference round trip is fast, but the service also runs an embedding
 # backbone; 30s is generous but bounded, so a hung upstream surfaces as an error
 # the UI can show rather than a request that never returns.
@@ -69,15 +89,26 @@ def health(timeout: float = 5.0) -> bool:
 
 
 def _state_to_custom_text(state: Mapping[str, Any]) -> str:
-    """Bare values, space-joined, in insertion order — see module docstring.
+    """Serialize the state as JSON — the same string the head trained on.
 
-    Newlines between fields are harmless (verified against the live v3 head:
-    left @ 0.9975 vs single-line left @ 0.9997), but the join stays
-    space-only: a "situation:" / "bricks:" field-name prefix measurably
-    flips correct answers to their opposites (left @ 0.9997 → right @ 0.988
-    with the prefix, same latents, gold=left).
+    This replaced a bare space-joined-values encoding, and the reason is worth
+    keeping: the head was trained on one format and asked about another. Every
+    documented failure of this adapter has been exactly that, so the fix is to
+    stop having two formats rather than to keep tuning one of them.
+
+    The earlier "join the values, drop the field names" rule came from serving a
+    *prose* head, where a "situation:" / "bricks:" prefix was out of
+    distribution and measurably flipped answers. That head no longer exists: the
+    warehouse corpus (decision_lab states/warehouse.py) renders flat JSON whose
+    keys are the field names, and split_state_fields() recovers those keys as
+    its leaf set on the way in — so the keys are the signal now, not noise.
+
+    Flat and scalar only, deliberately. server.py's _stringify_state calls str()
+    on each top-level value, so a nested object arrives as a Python repr; a list
+    is rendered by _flatten_json as one joined string. Either way the head is
+    shown text no training state contains.
     """
-    return " ".join(str(value) for value in state.values())
+    return json.dumps(dict(state), ensure_ascii=False)
 
 
 def _to_lab_questions(questions: Mapping[str, Dict[str, Any]]) -> tuple[list[Dict[str, Any]], list[str]]:
@@ -177,8 +208,14 @@ def predict(
     state: Mapping[str, Any],
     questions: Mapping[str, Dict[str, Any]],
     timeout: float = DEFAULT_TIMEOUT,
+    model: str | None = None,
 ) -> Dict[str, Any]:
     """Ask the decision_lab service, and return laya's result envelope.
+
+    Args:
+        model: the caller's model override. It is not sent upstream (the
+            service has no such field) but it selects the sub-path, so a
+            caller that asked for a problem-specific head gets it.
 
     Returns:
         {"model", "provider", "answers", "usage"} — the same shape
@@ -189,6 +226,9 @@ def predict(
         "custom_text": _state_to_custom_text(state),
         "questions": lab_questions,
     }
+    path = resolve_path(model)
+    if path is not None:
+        payload["path"] = path
     request = urllib.request.Request(
         base_url() + DECIDE_PATH,
         data=json.dumps(payload).encode("utf-8"),

@@ -127,18 +127,147 @@ honest decomposition in
 ### laya runs the warehouse
 
 `static/warehouse.html` (linked from the UI header) simulates a cargo house
-and three delivery robots on crossing routes, each with a forward lidar. When
-a robot's lidar sees another robot blocking its path, it serializes the
-situation to prose (who is ahead and how far, other robots' relative positions
-and motions, deliveries completed, seconds blocked) and asks laya
-`move: choice(left/stay/right)` — left/right sidestep around the obstacle,
-stay waits — so laya resolves the multi-agent blocking/deadlock problem. The screen
-shows the canvas with lidar cones and route lines, per-robot lidar chips,
-"Laya's view" (the state text the blocked robot sent) and "Laya's decisions"
-(action bars, confidence, latency, history). Hard collision prevention is
-independent of laya — physics never lets robots overlap; laya decides
-strategy. Toggle autoplay off to watch blocked robots stop forever: the
-deadlock laya prevents.
+and three delivery robots on crossing routes, each with a forward lidar. When a
+robot's lidar sees its path blocked, it serializes the situation to **a flat JSON
+state** and asks laya a question about the blocker. The screen shows the canvas
+with lidar cones and route lines, per-robot lidar chips, "Laya's view" (the exact
+JSON the blocked robot sent) and "Laya's decisions" (action bars, confidence,
+latency, history, and a `decided · deferred` counter for the geometry gate). Hard
+collision prevention is independent of laya — physics never lets robots overlap;
+laya decides strategy. Toggle autoplay off to watch blocked robots stop forever:
+the deadlock laya prevents.
+
+**There are two blockers and they are two different problems**, so the demo asks
+two different questions. A **storage rack** is static and never yields — waiting
+is *provably* wrong, so `stay` is not offered at all and the question is a 2-way
+`sidestep_direction` whose gold is the side with more room. Another **robot** can
+yield, so it gets the 3-way `avoid_direction`, where `stay` means *I give way* (a
+priority rule), not "the obstacle will clear". Measured over the recorded traffic,
+62% of blocks are racks (110/178) — so most of this demo is static avoidance, not
+multi-agent deadlock.
+
+The sim lives in `static/warehouse_sim.js` — a pure, seeded, DOM-free module.
+`warehouse.html` is only the DOM layer over it, and `eval_warehouse.mjs` imports
+the same file, so the browser and the harness cannot drift apart.
+
+#### The doc head answers this domain by surface form, not geometry
+
+`model=ciel_decision_model_v1` (the doc/breakout head) collapsed to a single
+action on warehouse states: **171 of 178** recorded decisions were `right`,
+reproduced live at 8/8, and it stayed `right` with the option order reversed and
+with the obstacle flipped from "to my left" to "to my right" — so it was neither a
+tie-break nor reading the geometry. The cause is coverage, not tuning: neither
+training JSONL contains a single occurrence of "warehouse", "storage rack",
+"dock", "lidar", "aisle" or "blocked", and the head's only spatial-choice
+training is Breakout paddle control — whose gold rule is the **opposite sign**
+(move *toward* the ball; sidestep *away from* the blocker).
+
+Prose-tuning could not fix it, which is worth recording because the two earlier
+Breakout fixes (`8fc3dd5`, `ebfc76c`) were exactly that and did work — there the
+prose *was* the head's training domain. Here, swapping the noun, changing the
+letter case, or appending one field each flipped the answer; sweeping the gap
+from 1 to 9999 px changed nothing, because a bge embedding is nearly insensitive
+to the value of a number. The fix is a trained head, not a better sentence.
+
+#### `ciel_warehouse_v1` — the warehouse head
+
+`model=ciel_warehouse_v1` selects a head trained on this domain as its own
+dynamic-head sub-path (`warehouse`) beside `doc` and `typed`, off the same bge-m3
+backbone. Its corpus is synthetic and template-rendered — `states/warehouse.py` in
+the decision_lab checkout, alongside `states/breakout.py` — so the gold is exact by
+construction and no LLM is involved. The rules it follows are Breakout's: gold
+comes from geometry, distractors are decorrelated from the gold, and templates with
+no direction words at all exist to force a geometry→direction mapping rather than a
+lexical shortcut.
+
+The state is **JSON now, not prose**, and that is the point: the corpus renders the
+same flat JSON the browser sends, so training and inference share one format. Both
+prior incidents in this project were train-here/infer-there mismatches, so the
+format is the contract rather than something to keep tuning. Two constraints follow
+and are pinned by `test_warehouse_sim.mjs`:
+
+- **Flat and scalar only.** `server.py` `str()`s each top-level value, so a nested
+  object would go upstream as a Python `repr` the head has never seen.
+- **At most 15 leaves.** The head prepends the whole text as field 0, and the
+  chunker merges leaves only above `max_fields` — so staying under it keeps the
+  decisive leaf (`obstacle_side`, or `gap_left`/`gap_right` for a rack) standing
+  alone instead of blended into a neighbour's text.
+
+#### The geometry gate, and the escalation trigger
+
+Two safety layers sit outside the model, and neither pretends the model is in the
+loop when it is not:
+
+- **The gate.** The geometrically feasible side set is computed before asking, and
+  an answer outside it is deferred to geometry *at any confidence* — a confident
+  impossible answer is still impossible. Below `CONF_FLOOR` the model is deferred
+  too, and the `decided · deferred` counter shows how often that happened.
+
+  `CONF_FLOOR` is **0.9**, from the warehouse head's measured closed-loop p10 (0.995)
+  rather than from a guess — and it is a *single* constant serving a dropdown that
+  can select models an order of magnitude below it (the doc head's p50 is 0.57, the
+  laya arms ~0.03). That is deliberate: those models answer this domain at chance or
+  worse, so deferring them to geometry is the outcome the gate exists for. A floor
+  reused across models does not mis-set itself, it silently disables itself, which is
+  why the number is derived per model and the counter is on screen.
+- **Escalation is now a stall timer, not a blocked timer.** The old trigger (5 s
+  continuously blocked) could not fire: across the 178 recorded calls the longest
+  block was **3 s**, so the 2-way branch was unreachable and `stay` was always on
+  the menu. `STALL_MS` keys on *progress staleness* instead — no forward movement —
+  which is the condition the demo actually cares about and holds for rack blocks too.
+
+Re-derive the oracle numbers with `node eval_warehouse.mjs --model ciel_warehouse_v1`;
+that per-side accuracy and confusion table is the evidence for the head, and the
+`--model ciel_decision_model_v1` run is the before picture.
+
+**Measured, closed-loop** (`node eval_warehouse.mjs`, service on the warehouse
+sub-path, 60 scenarios):
+
+| arm | accuracy vs geometry | prediction distribution | confidence p10 / p50 |
+| --- | --- | --- | --- |
+| `ciel_warehouse_v1` | **60/60 (100%)** | left 30 · right 30 | 0.995 / 0.998 |
+| `ciel_decision_model_v1` (before) | 20/40 (50%) | **left 40** — collapsed | 0.522 / 0.568 |
+
+The before arm is worth reading carefully: under the JSON state it collapsed to
+`left` rather than the `right` from the prose era, i.e. a different constant, still
+uncorrelated with geometry, still exactly chance. That is the shape of an
+out-of-domain answer, and it is why the fix had to be a trained head rather than
+another round of prose.
+
+**Measured, in-distribution** (`python -m decision_lab eval` on the warehouse
+config's `test_warehouse` split, 200 subsampled states, `results/report.md`):
+
+| question | per-label accuracy | confusion |
+| --- | --- | --- |
+| `avoid_direction` | left / right / stay **100%** each | clean diagonal (34 / 29 / 36) |
+| `sidestep_direction` | left / right **100%** each | clean diagonal (83 / 81) |
+
+Mean 65.8% is the average over both questions plus the derived predicates, not a
+per-question figure — the two choice questions are exact. The doc/breakout arm was
+re-measured on the same run as the regression gate: task in-dist 0.9067 against the
+0.924 baseline and breakout paddle 0.965 against 0.976, both inside the repository's
+stated ±2pp gate and its ~3pp seed variance.
+
+The 3-way robot branch is not sampled by the closed-loop run (see the limitation
+below), so it was probed directly against the service instead and is correct in all
+three cases: blocker right → `left` (0.997), blocker left → `right` (0.985),
+head-on → `stay` (1.000).
+
+**In the browser**, with `ciel_warehouse_v1` selected: decisions vary across all three
+actions at ~100% confidence, `blockedNow` repeatedly returns to 0, and deliveries
+accumulate — the partial gridlock the demo used to stall in is gone. The gate defers
+nothing on this head (324 decided · 0 deferred over a run), which is the expected
+result of a floor below the head's p10.
+
+**One limitation to know when reading the oracle.** The harness drives the sim, and
+it does not feed answers back into it — so the scenarios it samples are the ones the
+sim reaches *unopposed*, which under-samples genuinely deadlocked multi-robot blocks
+(a robot that is never told to wait never stalls). In the one run recorded so far,
+40/40 sampled scenarios were rack blocks and the 2-way question; the 3-way robot
+branch is exercised by the demo, not yet by the harness. Feeding decisions back into
+`eval_warehouse.mjs` is the obvious next step, and until then its accuracy is a
+statement about the rack branch.
+
 
 ### laya dispatches the bus fleet
 
