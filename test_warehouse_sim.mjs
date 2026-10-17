@@ -20,6 +20,8 @@ import {
   createWorld,
   feasibleOptions,
   goldDirection,
+  hitsRack,
+  nearestCorridor,
   questionId,
   scanLidar,
   step,
@@ -184,6 +186,140 @@ test("a sidestep takes the robot's progress, not just a timer", () => {
   advance(robots, { maxTicks: 400 });
   assert.ok(Math.hypot(r.x - before.x, r.y - before.y) > 1,
     "robot did not move at all");
+});
+
+test("nearestCorridor returns the nearer corridor", () => {
+  // It returned the farther one: the comparison was right but the branches were
+  // swapped, so every robot below y=284 was routed to the corridor at 146.
+  // That is not a cosmetically odd route — `cy` drives the first leg's y, so a
+  // robot at y=390 got a first leg from (55,390) to (55,146): a straight line
+  // through both rack rows, which the collision check refused. The robot was
+  // pinned at its spawn with 0 deliveries.
+  assert.equal(nearestCorridor(390), 330);
+  assert.equal(nearestCorridor(405), 330);
+  assert.equal(nearestCorridor(300), 330);
+  assert.equal(nearestCorridor(238), 238);
+  assert.equal(nearestCorridor(200), 238);
+  assert.equal(nearestCorridor(146), 146);
+});
+
+test("no route leg crosses a rack", () => {
+  // The invariant the routing bug violated. Stated as rack-crossing rather than
+  // "follows a corridor or aisle" on purpose: the first leg runs from wherever
+  // the robot happens to be to its corridor, and that is legitimately vertical
+  // at a non-aisle x as long as it starts outside the rack rows.
+  //
+  // The old first leg went from (55,390) straight up to (55,146), crossing both
+  // rows, which the collision check then refused — pinning the robot at spawn.
+  for (const seed of [1, 2, 3, 5, 7, 11, 42]) {
+    for (const robot of createWorld(seed)) {
+      const pts = [{ x: robot.x, y: robot.y }, ...robot.waypoints];
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i];
+        const steps = Math.ceil(Math.hypot(b.x - a.x, b.y - a.y));
+        for (let s = 0; s <= steps; s++) {
+          const t = steps ? s / steps : 0;
+          const x = a.x + (b.x - a.x) * t;
+          const y = a.y + (b.y - a.y) * t;
+          assert.ok(!hitsRack(x, y),
+            `seed ${seed} ${robot.id}: leg (${a.x},${a.y})->(${b.x},${b.y}) ` +
+            `crosses a rack near (${x.toFixed(0)},${y.toFixed(0)})`);
+        }
+      }
+    }
+  }
+});
+
+test("a robot reaches its pickup rack and delivers", () => {
+  // The end-to-end statement the routing bug broke: with the geometry oracle as
+  // the policy, robots must actually complete cycles. Before the fix this was
+  // 1 pickup in 60 s of sim time; it is now ~100.
+  const robots = createWorld(1);
+  const cfg = { ...CONFIG };
+  let now = 0, pickups = 0;
+  const prev = new Map();
+  const lastAsk = new Map();
+  for (let i = 0; i < 60000; i++) {
+    now += 16;
+    step(robots, 0.016, now, cfg);
+    for (const robot of robots) {
+      const scan = robot.obstacle;
+      if (scan && now - (lastAsk.get(robot.id) || 0) >= 300) {
+        lastAsk.set(robot.id, now);
+        const stalledFor = robot.lastProgressAt ? (now - robot.lastProgressAt) / 1000 : 0;
+        const options = feasibleOptions(scan.rack ? "rack" : "robot",
+          stalledFor * 1000 >= STALL_MS);
+        const gold = goldDirection(scan);
+        applyDecision(robot, options.includes(gold) ? gold : "left", now);
+      }
+      if (prev.get(robot.id) === "toPickup" && robot.phase === "toDock") pickups++;
+      prev.set(robot.id, robot.phase);
+    }
+  }
+  assert.ok(pickups >= 50, `only ${pickups} pickups — routing regressed`);
+  assert.ok(robots.reduce((n, r) => n + r.deliveries, 0) >= 50);
+});
+
+test("no robot ever leaves the floor", () => {
+  // A sidestep is a fixed-duration perpendicular crawl in one direction with no
+  // target, so near an edge it walked off the board — 51,558 ticks' worth before
+  // the bounds clamp, every one of them mid-sidestep.
+  for (const seed of [1, 5, 11]) {
+    const robots = createWorld(seed);
+    const lastAsk = new Map();
+    let now = 0;
+    for (let i = 0; i < 40000; i++) {
+      now += 16;
+      step(robots, 0.016, now, CONFIG);
+      for (const robot of robots) {
+        const scan = robot.obstacle;
+        if (scan && now - (lastAsk.get(robot.id) || 0) >= 300) {
+          lastAsk.set(robot.id, now);
+          const stalledFor = robot.lastProgressAt ? (now - robot.lastProgressAt) / 1000 : 0;
+          const options = feasibleOptions(scan.rack ? "rack" : "robot",
+            stalledFor * 1000 >= STALL_MS);
+          const gold = goldDirection(scan);
+          applyDecision(robot, options.includes(gold) ? gold : "left", now);
+        }
+        assert.ok(robot.x >= 0 && robot.x <= 520 && robot.y >= 0 && robot.y <= 420,
+          `seed ${seed} ${robot.id} left the floor at (${robot.x.toFixed(1)},${robot.y.toFixed(1)})`);
+      }
+    }
+  }
+});
+
+
+test("the oracle never contradicts the option set it is gated against", () => {
+  // The livelock this pins: `feasibleOptions` withdraws "stay" once a robot has
+  // stalled (waiting demonstrably failed), but a head-on blocker still made the
+  // oracle answer "stay". A gate deferring to that answer put the robot straight
+  // back into the wait it had just escalated out of — 791 deferred against 40
+  // decided, robots pinned in a permanent head-on standoff.
+  //
+  // The oracle and the option set are the two halves of one rule, so they must
+  // agree at every blocker, stall state and geometry the sim can produce.
+  for (const seed of [1, 2, 3, 5, 7, 11, 42, 99, 123]) {
+    const robots = createWorld(seed);
+    const lastAsk = new Map();
+    let now = 0;
+    for (let i = 0; i < 40000; i++) {
+      now += 16;
+      step(robots, 0.016, now, CONFIG);
+      for (const robot of robots) {
+        const scan = robot.obstacle;
+        if (!scan || now - (lastAsk.get(robot.id) || 0) < 300) continue;
+        lastAsk.set(robot.id, now);
+        const stalledFor = robot.lastProgressAt ? (now - robot.lastProgressAt) / 1000 : 0;
+        const stalled = stalledFor * 1000 >= STALL_MS;
+        const kind = scan.rack ? "rack" : "robot";
+        const gold = goldDirection(scan, stalled);
+        assert.ok(feasibleOptions(kind, stalled).includes(gold),
+          `seed ${seed} ${robot.id}: oracle "${gold}" is not on the menu ` +
+          `(kind=${kind}, stalled=${stalled}) — the gate would invert the escalation`);
+        applyDecision(robot, gold, now);
+      }
+    }
+  }
 });
 
 test("createWorld is deterministic for a given seed", () => {

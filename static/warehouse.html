@@ -211,7 +211,7 @@ async function askCJet(robot, scan, now) {
 
   // The geometry answer, computed before asking: it is the oracle the eval
   // scores against and the gate's fallback, so it must not read the model.
-  const oracle = S.goldDirection(scan);
+  const oracle = S.goldDirection(scan, stalled);
   const feasible = S.feasibleOptions(kind, stalled);
 
   try {

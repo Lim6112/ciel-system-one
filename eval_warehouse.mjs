@@ -53,7 +53,7 @@ function collectScenarios(n, seed) {
         kind,
         question: S.buildQuestion(kind, stalled),
         state: S.buildState(robot, scan, now),
-        gold: S.goldDirection(scan),
+        gold: S.goldDirection(scan, stalled),
         feasible: S.feasibleOptions(kind, stalled),
       });
       robot._taken = now;

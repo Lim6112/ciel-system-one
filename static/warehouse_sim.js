@@ -73,12 +73,27 @@ export const fmtM = px => `${Math.max(1, Math.round(px / PX_PER_M))} m`;
 // Robots move only along safe lines: corridors are clear horizontally, aisle
 // gaps are clear vertically. Any route is a corridor/aisle L-shaped chain.
 
+export function clamp(value, lo, hi) {
+  return Math.min(hi, Math.max(lo, value));
+}
+
 export function nearestAisle(x) {
   return AISLE_XS.reduce((a, b) => Math.abs(b - x) < Math.abs(a - x) ? b : a);
 }
 
 export function nearestCorridor(y) {
-  return CORRIDOR_YS.reduce((a, b) => Math.abs(b - y) < Math.abs(a - y) ? a : b);
+  // Returns the NEARER corridor. It returned the farther one until this was
+  // fixed: the comparison was right but the branches were swapped, so any robot
+  // below y=284 was sent to the corridor at 146 rather than the one at 330.
+  //
+  // The damage was not a wrong-looking route but a route off the map: `cy` drove
+  // the first leg's y, so R1 at y=390 was routed to (55,146) — one straight line
+  // from the bottom of the board to the top, straight through both rack rows,
+  // which the hard collision check then refused, pinning the robot at its spawn
+  // with 0 deliveries. Route legs must only ever travel along y=146/238/330
+  // (rows are clear horizontally) or x=140/260/380 (aisles are clear
+  // vertically); the old first leg satisfied neither.
+  return CORRIDOR_YS.reduce((a, b) => Math.abs(b - y) < Math.abs(a - y) ? b : a);
 }
 
 // row A is approached from the top corridor, row B from the bottom corridor —
@@ -353,14 +368,27 @@ export function hitsRack(x, y) {
 // Which way actually clears a blocker, from geometry alone. This is the oracle
 // eval_warehouse.mjs scores the model against, and the gate's fallback — so it
 // must not read any surface word.
-export function goldDirection(scan) {
+export function goldDirection(scan, stalled = false) {
   if (scan.rack) {
     // Away from where the rack sits — which is also the wider-gap side.
     const lateral = scan.rackLateral ?? 0;
     return lateral > 0 ? "left" : "right";
   }
   const rel = scan.rel || { x: 0 };
-  if (Math.abs(rel.x) <= 12) return "stay";
+  // Head-on. `stalled` decides which of the two head-on answers applies, and
+  // the flag is not optional trivia: without it this returns "stay", which
+  // `feasibleOptions` has just withdrawn because waiting demonstrably failed. A
+  // gate that defers to this answer would put the robot straight back into the
+  // wait it escalated out of, forever — measured at 791 deferred against 40
+  // decided, with robots pinned in a head-on standoff.
+  if (Math.abs(rel.x) <= 12) {
+    // Head-on and stalled: there is no preferred side to read off the offset
+    // (it is ~zero), so the answer is a fixed "left". A fixed choice is what
+    // makes it a symmetry break rather than a coin flip: two robots facing each
+    // other have opposite headings, so each one's "left" is the other's right in
+    // world space — they move apart instead of mirroring into another standoff.
+    return stalled ? "left" : "stay";
+  }
   return rel.x > 0 ? "left" : "right";       // away from the blocker
 }
 
@@ -428,13 +456,22 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay }) {
       vy = dy / dist * speed;
     }
 
-    // hard safety: never overlap another robot, whatever CJet decided. If the
-    // direct move is blocked, slide along at increasing angles — otherwise two
-    // robots approaching head-on can push-lock outside each other's lidar cone.
+    // hard safety: never overlap another robot or leave the floor, whatever CJet
+    // decided. If the direct move is blocked, slide along at increasing angles —
+    // otherwise two robots approaching head-on can push-lock outside each other's
+    // lidar cone.
+    //
+    // The bounds check is not decoration: a sidestep is a perpendicular crawl for
+    // a fixed 1.5 s in one direction, with no target and no other reason to stop,
+    // so a robot that sidesteps near an edge used to walk straight off the board
+    // (measured: 2-6% of ticks at the demo's cadence, every one of them mid-
+    // sidestep). Clamping rather than refusing the move keeps the slide-angles
+    // useful: a robot at a wall still gets to slide along it.
     for (const off of [0, 0.6, -0.6, 1.2, -1.2, Math.PI / 2, -Math.PI / 2]) {
       const sx = vx * Math.cos(off) - vy * Math.sin(off);
       const sy = vx * Math.sin(off) + vy * Math.cos(off);
-      const nx = robot.x + sx * dt, ny = robot.y + sy * dt;
+      const nx = clamp(robot.x + sx * dt, ROBOT_R, W - ROBOT_R);
+      const ny = clamp(robot.y + sy * dt, ROBOT_R, H - ROBOT_R);
       const collides = robots.some(o => o !== robot &&
         Math.hypot(nx - o.x, ny - o.y) < MIN_SEP) || hitsRack(nx, ny);
       if (!collides) { robot.x = nx; robot.y = ny; break; }
