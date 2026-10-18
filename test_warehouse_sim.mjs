@@ -43,8 +43,10 @@ import {
   H,
   rejoinPath,
   scanLidar,
+  makeRobot,
   step,
 } from "./static/warehouse_sim.js";
+import { mulberry32 } from "./static/rng.js";
 
 const CONFIG = { speed: 80, lidarRange: 90, autoplay: true };
 
@@ -840,4 +842,59 @@ test("omitting the permitted set keeps the legacy shape", () => {
     ["left", "stay", "right"]);
   assert.deepEqual(Object.keys(buildQuestion("robot", true, true).criteria),
     ["backward", "left", "stay", "right"]);
+});
+
+test("a deadlocked state withholds obstacle_side", () => {
+  // The field that decides the answer, and the reason the escape was answering
+  // `left`. Measured on the live service against real wedged states: with
+  // `obstacle_side` present the warehouse head answers `left` at confidence 1.00 and
+  // `backward` at 0.00; with the field withheld the same state answers `backward` at
+  // 0.90. Removing any OTHER field changes nothing -- the effect is entirely this one.
+  //
+  // It is also the honest omission rather than a trick. A deadlocked robot does have a
+  // side, but it has been sidestepping for DEADLOCK_MS without freeing itself, so the
+  // side is the one fact the failure has already invalidated, and reporting it is what
+  // invited a sidestep answer to a situation sidestepping did not resolve.
+  const scene = collectBlocked("robot", 1)[0];
+  const robot = scene.robot;
+
+  const normal = buildState(robot, scene.scan, scene.now, null, false, null);
+  assert.ok("obstacle_side" in normal,
+    "an ordinary blocked robot must still be told the side");
+
+  const wedged = buildState(robot, scene.scan, scene.now, null, true,
+    { deadlock: "wedged, no progress for 8s" });
+  assert.ok(!("obstacle_side" in wedged),
+    `a deadlocked state kept the side: ${JSON.stringify(wedged.obstacle_side)}`);
+  // The rest of the observation survives, so the model still knows where the blocker is.
+  assert.ok("obstacle_position" in wedged && "obstacle_kind" in wedged,
+    `the deadlock state lost the blocker description: ${JSON.stringify(wedged)}`);
+  assert.equal(wedged.deadlock, "wedged, no progress for 8s");
+  assert.ok(!("obstacle_side" in wedged));
+});
+
+test("the deadlock state skips the head-on side rewrite", () => {
+  // The rewrite names a side to turn a standstill into a sidestep. On a deadlock that
+  // is both useless and self-defeating -- it is the instruction that has already
+  // failed -- and it re-introduces the field above, which is what suppressed the
+  // escape. Same robot, dead ahead, role present: rewritten when live, untouched when
+  // deadlocked.
+  const robots = createWorld(1);
+  const [a, b] = [robots[0], robots[1]];
+  // Same dead-ahead geometry the rewrite test uses, so the rewrite is guaranteed to
+  // be the thing under test rather than whether these two happen to see each other.
+  a.x = 260; a.y = 330; a.heading = Math.PI; a.waypoints = [{ x: 100, y: 330 }]; a.wp = 0;
+  b.x = 220; b.y = 330; b.heading = 0; b.waypoints = [{ x: 400, y: 330 }]; b.wp = 0;
+  bindWorld(robots);
+  const scan = scanLidar(a, robots, CONFIG.lidarRange);
+  assert.ok(scan && !scan.rack, "expected a robot ahead");
+  const role = headOnRole(a, scan);
+  assert.ok(role, "a dead-ahead pair must be elected");
+
+  const live = buildState(a, scan, 0, role, false, null);
+  assert.ok("obstacle_side" in live, "the rewrite should name a side for a live robot");
+
+  const wedged = buildState(a, scan, 0, role, true, { deadlock: "wedged" });
+  assert.ok(!("obstacle_side" in wedged),
+    `the rewrite ran on a deadlock: ${JSON.stringify(wedged.obstacle_side)}`);
 });

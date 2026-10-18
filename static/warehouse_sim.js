@@ -909,7 +909,24 @@ export function buildState(robot, scan, now = 0, role = null, deadlocked = false
     const side = rel.x > 12 ? "right" : rel.x < -12 ? "left" : "center";
     doc.obstacle_kind = "robot";
     doc.obstacle_id = scan.other;
-    doc.obstacle_side = side;
+    // ---- THE SIDE IS WITHHELD ON A DEADLOCK, AND THAT IS A BUG FIX --------------
+    //
+    // `obstacle_side` names which way to step around a robot, and the warehouse head
+    // has learned that mapping hard: with the field present it answers `left` at
+    // confidence 1.00 on EVERY deadlocked state, suppressing `backward` completely.
+    // Measured against the live service, removing fields one at a time from a real
+    // wedged state: only `obstacle_side` flips the answer, everything else is
+    // irrelevant, and without it the same state answers `backward` at 0.90.
+    //
+    // It is also the honest thing to omit. A deadlocked robot HAS a side, but it has
+    // been sidestepping for DEADLOCK_MS and is still stuck, so the side is the one
+    // piece of information the state knows to be useless -- and reporting it is what
+    // invited a sidestep answer to a question about a situation sidestepping failed
+    // to resolve. Withholding it is not hiding data; it is declining to restate a
+    // fact the failure has already invalidated.
+    //
+    // `obstacle_position` stays, so the state still says where the blocker is.
+    if (!deadlocked) doc.obstacle_side = side;
     doc.obstacle_position = side === "center"
       ? "ahead of me, but not blocking my lane"
       : "ahead, off to one side of my lane";
@@ -939,7 +956,15 @@ export function buildState(robot, scan, now = 0, role = null, deadlocked = false
   // The side comes from geometry, not from the model: whoever is not elected to go
   // first steps aside, and which side is theirs is read off their heading. Letting
   // the model choose it would be the gate this demo removed.
-  if (doc.obstacle_kind === "robot" && doc.obstacle_side === "center" && role) {
+  //
+  // NOT ON A DEADLOCK. This rewrite exists to turn a head-on standstill into a
+  // sidestep, and a deadlocked robot is one that has already been sidestepping for
+  // DEADLOCK_MS without freeing itself -- so telling it which way to step is at best
+  // useless and at worst the exact instruction that has failed. It also re-introduces
+  // the field withheld above, and the head answers that field hard: measured, a
+  // wedged state carrying `obstacle_side` answers `left` at confidence 1.00 with
+  // `backward` at 0.00, while the same state without it answers `backward` at 0.90.
+  if (!deadlocked && doc.obstacle_kind === "robot" && doc.obstacle_side === "center" && role) {
     // Both roles are told a side, because "in my lane" plus "center" is not enough:
     // measured on the live service, that combination still answers `stay` for one
     // robot in four (l=33% s=47%), which is the same stall this rewrite exists to

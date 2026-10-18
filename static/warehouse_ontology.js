@@ -161,14 +161,14 @@ export const TBOX = [
     // An earlier version read "wedged, no progress for 8s; sidestepping has not freed
     // me", and it was shortened on the theory that mentioning sidestepping pulled the
     // head toward the `left`/`right` criteria, which also say "sidestep". THAT THEORY
-    // IS NOT SUPPORTED: measured against the live service, both sentences answer
-    // `backward` on the warehouse head (0.78 for the short one, 0.57 for the long one)
-    // and on the service default (0.57 / 0.72), so the extra clause changes the
-    // margin but never the choice. The shorter sentence is kept because it is shorter
-    // and says the same thing, not because it fixed anything.
+    // IS NOT SUPPORTED, and neither is any strong claim about this leaf's wording:
+    // measured against the live service, a short phrasing and a long explanatory one
+    // both answer `backward` at the SAME confidence (0.94), so the text here is not
+    // what moves the answer. The shorter sentence is kept because it is shorter.
     //
-    // What DOES change the answer is the sub-path, and the note at the bottom of this
-    // axiom's comment is the thing to read before puzzling over a `left` here.
+    // What DOES decide it is the sub-path, and -- more sharply -- whether
+    // `obstacle_side` is present. Both are recorded on this axiom because a `left`
+    // here is otherwise very hard to attribute.
     stateLeaf: { deadlock: "wedged, no progress for 8s" },
     comment:
       "Tier 1. A deadlocked robot -- stuck AND blocked for DEADLOCK_MS (8 s) -- is " +
@@ -183,17 +183,22 @@ export const TBOX = [
       // The measured failure mode, recorded where someone debugging a wrong answer will
       // actually be reading. It is NOT the observation text, which was the first
       // suspect and a dead end: both wordings answer `backward`.
-      "WHICH HEAD YOU ASK DECIDES THIS ONE. Measured against the live service on the " +
-      "same wedged state and the same three options -- " +
-      "warehouse sub-path: backward 0.81/0.92/0.99/0.77 across four state shapes; " +
-      "service default (doc): backward 0.58/0.69/0.59/0.49; " +
-      "typed sub-path: left or right, backward never above 0.33. " +
-      "The `typed` head is trained on typed-decisions and has no warehouse training, " +
-      "so it cannot answer this question at all -- and because it always returns one " +
-      "of the options it was sent, the failure looks like a considered `left` rather " +
-      "than the out-of-domain answer it is. `ciel_typed_v1` in the Model dropdown " +
-      "reaches that sub-path. If a deadlock answers `left`, check the dropdown before " +
-      "touching the state text.",
+      "A `left` HERE HAS TWO CAUSES AND THE STATE TEXT IS NEITHER OF THEM. Measured " +
+      "against the live service on real wedged states. " +
+      "FIRST, `obstacle_side`: present, this head answers `left` at confidence 1.00 " +
+      "with `backward` at 0.00; absent, the same state answers `backward` at 0.90. It " +
+      "is the single field that decides the answer -- removing any other one changes " +
+      "nothing -- and buildState therefore withholds it, and skips the head-on side " +
+      "rewrite, whenever `deadlocked` is set. " +
+      "SECOND, the sub-path: warehouse gives backward 0.81/0.92/0.99/0.77 over four " +
+      "state shapes, the service default 0.58/0.69/0.59/0.49, and the `typed` " +
+      "sub-path left or right with backward never above 0.33. The `typed` head has no " +
+      "warehouse training, so it cannot answer the question at all -- and since it " +
+      "always returns one of the options it was sent, that failure looks like a " +
+      "considered `left`. `ciel_typed_v1` in the Model dropdown reaches it. " +
+      "So if a deadlock answers `left`: check the dropdown, then check that " +
+      "`obstacle_side` is absent -- and do not start with the observation text, which " +
+      "was measured to make no difference (0.94 either way).",
   },
 ];
 
