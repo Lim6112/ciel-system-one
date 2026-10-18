@@ -45,14 +45,24 @@ export const ROBOT_R = 9;
 export const MIN_SEP = 2 * ROBOT_R + 3;                   // hard collision safety
 
 // Lidar half-angle: the default, and the slider range the page exposes.
-// 45 deg was the only value this sim ever ran, hard-coded at the scan site. It is
-// now a parameter because the demo wants to show what the cone width buys, and
-// because the value is doing real work: a narrower cone sees a cross-traffic robot
-// later, so the robot commits further into an encounter before it has any reason
-// to yield. Default unchanged so every pinned number still describes this build.
-export const LIDAR_HALF_ANGLE = 45 * Math.PI / 180;
+// It was 45 deg (the only value this sim ever ran, hard-coded at the scan site) and
+// is now 15 deg, set by request. The value is doing real work: a narrower cone sees
+// a cross-traffic robot later, so the robot commits further into an encounter before
+// it has any reason to yield. Every measured number recorded in this file above the
+// navigation section was taken at 45 deg, so those numbers describe a configuration
+// this build no longer starts in -- see LIDAR_ANGLE_DEFAULT_NOTE below.
+export const LIDAR_HALF_ANGLE = 15 * Math.PI / 180;
 export const LIDAR_ANGLE_MIN = 5 * Math.PI / 180;         // narrowest the slider allows
 export const LIDAR_ANGLE_MAX = 90 * Math.PI / 180;        // widest; >90 would see behind
+
+// Lidar RANGE in pixels: how far the cone reaches. 90 was the demo's value; 70 is
+// set by request. Range and angle interact, and the interaction is the reason to
+// keep both sliders rather than one: a narrow cone at long range still sees an
+// approaching robot in time, while a narrow cone at 70 px sees the same robot
+// roughly one third of a second before contact at demo speed.
+export const LIDAR_RANGE_DEFAULT = 70;
+export const LIDAR_RANGE_MIN = 50;
+export const LIDAR_RANGE_MAX = 150;
 // 1500 ms, i.e. ~119 px at demo speed, and MEASURED AS SPENT IN FULL: every
 // completed sidestep ran 1488 ms and travelled 119 px, to the millisecond and the
 // pixel. Two robots are 18 px across and need to clear each other by MIN_SEP (21 px),
@@ -126,7 +136,12 @@ export const LIDAR_ANGLE_MAX = 90 * Math.PI / 180;        // widest; >90 would s
 // standing behaviour and the only arm that has survived measurement. Any number here
 // bounds the distance instead; see `sidestepBudgetSpent` for why the bound is a
 // number fixed at decision time rather than a live "is it clear" test.
-export const SIDESTEP_PX = null;
+//
+// SET TO 30 BY REQUEST, AND THE TABLE ABOVE SAYS WHAT THAT COSTS: 30 px measured
+// 42% of baseline deliveries in the sweep. It is the arm that exists to make the
+// failure visible rather than an improvement, so it is the demo's default now and
+// not a recommendation -- the sliders can take it back to unbounded in one drag.
+export const SIDESTEP_PX = 30;
 
 // The timer that caps a sidestep regardless of distance, so a slow robot cannot
 // crawl indefinitely. Was the only bound until SIDESTEP_PX was added.
@@ -488,7 +503,7 @@ export function rackPickPoint(rack) {
 //
 // `navRouter` selects between them at runtime so the comparison is one call, not a
 // git stash. See the navigation-router slider in warehouse.html.
-let NAV_ROUTER = "chain";
+let NAV_ROUTER = "grid";
 export function navRouter() { return NAV_ROUTER; }
 export function setNavRouter(name) { NAV_ROUTER = name === "grid" ? "grid" : "chain"; }
 
@@ -828,6 +843,33 @@ function describeOther(robot, id) {
 let robotsById = new Map();
 export function bindWorld(robots) {
   robotsById = new Map(robots.map(r => [r.id, r]));
+  // Drop separation records for robots that are no longer in the world. A fresh run
+  // reusing the same ids must not inherit the previous run's contested points and
+  // start off routing around a robot that is no longer there.
+  const live = new Set(robots.map(r => r.id));
+  for (const id of [...separatedFromRobots.keys()]) if (!live.has(id)) separatedFromRobots.delete(id);
+}
+
+// The lane node each robot most recently claimed when rejoining, and when. A rejoin
+// that would land on another robot's claim is refused and moved on — see the note in
+// `rejoinPath` for the two-robot loop this breaks and the measurement behind it.
+//
+// A claim EXPIREs rather than being cleared on rejoin, because the node stays
+// dangerous for as long as the robot that took it is still driving through it.
+// REJOIN_MEMORY_MS is roughly the time to clear a lane node at demo speed.
+const REJOIN_MEMORY_MS = 2000;
+const separatedFromRobots = new Map();
+
+function noteRejoin(id, point, now) {
+  separatedFromRobots.set(id, { id, point: { x: point.x, y: point.y }, at: now });
+}
+
+// Active claims, expired ones dropped. Returns an array, not the Map — iterating a
+// Map yields [key, value] pairs, which silently makes every `other.point` undefined.
+function liveRejoins(now) {
+  for (const [id, rec] of separatedFromRobots)
+    if (now - rec.at > REJOIN_MEMORY_MS) separatedFromRobots.delete(id);
+  return [...separatedFromRobots.values()];
 }
 
 // ---- head-on priority -------------------------------------------------------
@@ -950,7 +992,13 @@ export function headOnRole(robot, scan) {
 //
 // `from` is a robot-like object with x/y; returning the input unchanged means the
 // re-plan found nothing better, and the caller keeps its existing path.
-export function rejoinPath(robot) {
+// The minimum distance a rejoin point must keep from another robot's recent rejoin
+// point. 20 px is the demo's own number rather than a derived one: two robots are
+// 18 px across and must clear each other by MIN_SEP (21 px), so a shared lane node
+// is only survivable if the two occupancies are at least this far apart along it.
+export const SEPARATION_PX = 20;
+
+export function rejoinPath(robot, now = 0) {
   const pts = robot.waypoints;
   if (!pts || pts.length === 0) return false;
   const here = { x: robot.x, y: robot.y };
@@ -997,9 +1045,103 @@ export function rejoinPath(robot) {
   const useQ = dToQ <= dToP;
   const rejoin = useQ ? q : p;
   const keepIdx = useQ ? best + 1 : best;
-  const alreadyThere = Math.hypot(here.x - rejoin.x, here.y - rejoin.y) < 2;
-  const tail = pts.slice(keepIdx + (alreadyThere ? 1 : 0));
-  const next = alreadyThere ? tail : [rejoin, ...tail];
+
+  // ---- DO NOT REJOIN ONTO A POINT ANOTHER ROBOT IS ALSO REJOINING TO ----------
+  //
+  // THE BUG THIS FIXES, confirmed by instrumenting every rejoin call. Two robots
+  // meet, both sidestep to get around each other, and both then project themselves
+  // back onto their own planned route. Each route is fine on its own, but the two
+  // routes SHARE the lane nodes they were both planned through -- so both robots
+  // pull into the SAME node, arrive together, re-block, sidestep again, and rejoin
+  // to the same node again. A stable two-body loop at a fixed point.
+  //
+  // Measured over five seeds, counting a rejoin that lands within SEPARATION_PX of
+  // another robot's rejoin chosen in the last 2 s:
+  //
+  //   chain (the default)   938 of 4367 rejoins (21.5%), most of them at 0.0 px
+  //   grid                   64 of 5446 rejoins ( 1.2%)
+  //
+  // The 0.0 px cases are the loop exactly: R2 rejoins (140,330) 0.0 px from where
+  // R1 rejoined 304 ms earlier, and does it again 1824 ms later.
+  //
+  // THE FIX. When the robot's own nearest rejoin point is contested, it takes a
+  // point SEPARATION_PX further along its own route instead — a point on a leg it
+  // was going to drive anyway — and the intervening stretch of route is dropped,
+  // because it has just been skipped over.
+  //
+  // Why not simply pick a LATER VERTEX of the route, which is the obvious reading of
+  // "rejoin elsewhere": that replaces a short correction leg with a long straight
+  // one from wherever the robot happens to be, and the long leg cuts across the
+  // floor. Measured, with a rack check added so the leg was at least legal: 869
+  // deliveries against 1029, because every accepted vertex was far away and the
+  // detour to it was pure extra travel. Shifting along the route keeps the
+  // correction leg short and rack-clear for free: it *is* the planned route.
+  const claims = liveRejoins(now);
+  // A candidate rejoin point is refused if it sits within SEPARATION_PX of either
+  //   (a) where another robot is RIGHT NOW, or
+  //   (b) a point another robot claimed when it rejoined in the last couple of
+  //       seconds and is therefore still driving through.
+  //
+  // (a) is the direct form of the rule and the one that matters: the robot that
+  // collided with us is exactly the one standing near the node we would otherwise
+  // project onto, so checking live positions refuses the point that would put us
+  // back on top of it. (b) exists because the other robot may have moved on from
+  // the node it claimed while we are still arriving, and a node cannot be trusted
+  // just because its occupant has left it.
+  const contested = (pt) => {
+    for (const other of robotsById.values()) {
+      if (other.id === robot.id) continue;
+      if (Math.hypot(other.x - pt.x, other.y - pt.y) < SEPARATION_PX) return true;
+    }
+    return claims.some(c => c.id !== robot.id
+      && Math.hypot(c.point.x - pt.x, c.point.y - pt.y) < SEPARATION_PX);
+  };
+  // Walk FORWARD along the route by `dist`, stopping at the last vertex if the route
+  // is shorter than that. The result is a point on this robot's own remaining route,
+  // so the leg to it is a stretch of planned route rather than a new straight line.
+  const shiftAlong = (dist) => {
+    let left = dist, at = { x: rejoin.x, y: rejoin.y };
+    for (let i = keepIdx; i < pts.length; i++) {
+      const seg = Math.hypot(pts[i].x - at.x, pts[i].y - at.y);
+      if (seg >= left) {
+        const t = seg === 0 ? 0 : left / seg;
+        return { x: at.x + (pts[i].x - at.x) * t, y: at.y + (pts[i].y - at.y) * t, idx: i };
+      }
+      left -= seg; at = { x: pts[i].x, y: pts[i].y };
+    }
+    return null;      // no room left on this route
+  };
+
+  let chosen = null, chosenIdx = -1;
+  if (!contested(rejoin)) {
+    chosen = rejoin; chosenIdx = keepIdx;
+  } else {
+    // Walk FORWARD along this robot's own route in SEPARATION_PX steps until we
+    // clear every other robot's claim. Forward is the direction the robot is
+    // already travelling, so the correction leg is a stretch of planned route
+    // rather than a new straight line, and the intermediate route is dropped
+    // because it has just been skipped.
+    //
+    // FORWARD ONLY, AND NEVER A JUMP TO THE NEXT VERTEX. Both look equivalent and
+    // both measured worse. Allowing the rear end of the current segment sends a
+    // robot backwards up its own route, which on many short segments (the grid
+    // arm's 50 px legs) is most of them: grid fell 662 -> 177. Jumping straight to
+    // the next vertex skips an arbitrary distance instead of the minimum, and on
+    // the chain arm a segment can be 380 px: chain fell 1029 -> 819.
+    for (let mult = 1; mult <= 8 && !chosen; mult++) {
+      const cand = shiftAlong(SEPARATION_PX * mult);
+      if (!cand || contested(cand)) continue;
+      chosen = cand; chosenIdx = Math.min(cand.idx, pts.length - 1);
+    }
+  }
+  // Nothing on the remaining route was clear. Taking a contested point risks another
+  // loop, but taking NO point leaves the robot standing still permanently, which is
+  // worse — so the original projection stands as the fallback rather than refused.
+  if (!chosen) { chosen = rejoin; chosenIdx = keepIdx; }
+
+  const alreadyThere = Math.hypot(here.x - chosen.x, here.y - chosen.y) < 2;
+  const tail = pts.slice(chosenIdx + (alreadyThere ? 1 : 0));
+  const next = alreadyThere ? tail : [chosen, ...tail];
   // Never leave the robot with no waypoints. An empty path is read as "arrived" by
   // the step loop, which would fire a phase change from a swerve rather than from
   // reaching the goal — so a re-plan that empties the path is refused and the
@@ -1007,6 +1149,9 @@ export function rejoinPath(robot) {
   if (next.length === 0) return false;
   robot.waypoints = next;
   robot.wp = 0;
+  // Claim the point we just committed to, so a colleague rejoining into the same
+  // lane in the next couple of seconds has to pick a different one.
+  noteRejoin(robot.id, chosen, now);
   return true;
 }
 
@@ -1208,7 +1353,7 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
     // the router for a new one — see `rejoinPath` for why re-routing backtracks.
     // Gated so the difference is measurable rather than assumed.
     if (replanAfterSidestep && robot.wasSidestepping && now >= robot.sidestepUntil) {
-      rejoinPath(robot);
+      rejoinPath(robot, now);
     }
     robot.wasSidestepping = now < robot.sidestepUntil;
 

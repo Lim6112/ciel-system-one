@@ -129,52 +129,66 @@
           <input type="range" id="speed" min="40" max="140" step="10" value="80">
           <label id="speedLabel">80 px/s</label></span>
         <span class="ctl"><label>Lidar range</label>
-          <input type="range" id="lidar" min="50" max="150" step="10" value="90">
-          <label id="lidarLabel">90 px</label></span>
+          <input type="range" id="lidar" min="50" max="150" step="10" value="70">
+          <label id="lidarLabel">70 px</label></span>
         <span class="ctl"><label>Lidar angle</label>
-          <input type="range" id="lidarAngle" min="5" max="90" step="5" value="45">
-          <label id="lidarAngleLabel">45°</label></span>
+          <input type="range" id="lidarAngle" min="5" max="90" step="5" value="15">
+          <label id="lidarAngleLabel">15°</label></span>
         <span class="ctl"><label>Router</label>
           <select id="router">
-            <option value="chain" selected>chain — 3 lanes, fewer deadlocks</option>
-            <option value="grid">grid — 50 px, shorter paths</option>
+            <option value="grid" selected>grid — 50 px, shorter paths</option>
+            <option value="chain">chain — 3 lanes, fewer deadlocks</option>
           </select></span>
         <span class="ctl"><label>Sidestep</label>
-          <input type="range" id="sidestep" min="10" max="1000" step="10" value="1000">
-          <label id="sidestepLabel">unbounded</label></span>
+          <input type="range" id="sidestep" min="10" max="1000" step="10" value="30">
+          <label id="sidestepLabel">30 px</label></span>
       </div>
       <p class="meta" style="margin:8px 0 0">
         <strong>Sidestep</strong> caps how far one evasion manoeuvre may travel. At
         the maximum it is unbounded, which is the long-standing behaviour; below it,
-        the manoeuvre stops at that distance and the robot resumes its route. Worth
-        trying: the swerve is roughly as large as all forward progress, and nothing
-        has yet measured better than unbounded — six attempts are recorded in
-        <code>warehouse_sim.js</code>.
+        the manoeuvre stops at that distance and the robot resumes its route.
+        <br>
+        The <strong>30 px</strong> default is set deliberately and is <em>not</em> an
+        improvement: in the sweep recorded in <code>warehouse_sim.js</code> a 30 px
+        budget measured 42% of baseline deliveries, and no budget measured on that
+        sweep reduced sidestep travel at all. Shorter is worse because a robot that
+        stops short of clearing an obstacle is re-blocked next tick and sidesteps
+        again, so a shorter manoeuvre buys more manoeuvres. Drag this to the maximum
+        to see the behaviour every other number in this file was measured at.
         <br>
         Below <strong>21 px</strong> (two robot radii plus the safety margin) a robot
         cannot clear another robot at all, so the low end does not shorten the
         manoeuvre — it makes each one fail and start again, and you will see the
-        swerving get worse rather than better. That end of the range is there to make
-        the failure visible, not because it is worth using.
+        swerving get worse rather than better.
         <br><br>
-        <strong>Lidar angle</strong> is the half-width of the forward cone. It affects
-        robot-vs-robot detection only: a rack is found by a straight ray down the
-        heading, deliberately <em>not</em> by the cone, so that a robot aimed through a
-        50 px aisle does not read the flanking rack corners as a wall ahead
-        (<code>warehouse_sim.js</code>, <code>rayHitsRack</code>). Narrow the cone and
-        a robot sees a crossing counterpart later, commits further into the encounter,
-        and has less room to yield — which is why the default, not the widest setting,
-        is what every measured number in this file was taken at.
+        <strong>Lidar range</strong> is how far the cone reaches and <strong>lidar
+        angle</strong> is its half-width, defaulting to 70 px and 15°. Together they
+        set how early a robot notices a crossing counterpart. Both defaults are
+        narrower and shorter than the 90 px / 45° every other number in
+        <code>warehouse_sim.js</code> was measured at, and the effect is substantial
+        in both directions: the short narrow cone almost <em>doubles</em> throughput,
+        because a robot that never sees the other one coming never stops for it. The
+        cost is paid in collisions avoided rather than in deliveries, so it is worth
+        dragging back to 90 px / 45° to watch the difference.
+        <br>
+        Range and angle are separate knobs on purpose: a narrow cone at long range
+        still sees an approaching robot in time, whereas a narrow cone at 70 px sees
+        the same robot well under half a second before contact.
         <br><br>
-        <strong>Router</strong> switches the path planner and is the fair comparison in
-        reverse: the <em>grid</em> router plans over a uniform 50 px lattice with
-        Dijkstra, so its routes are 17% shorter and none of its legs crosses a rack —
-        but it delivers <strong>36% fewer</strong> cycles (662 against 1029 over ten
-        seeds). A shortest path is free to use ~20 lanes, while the <em>chain</em>
-        router pins every robot to three corridors and three aisles; on three lanes a
-        meeting is reliably head-on and the priority election fires, whereas offset
-        lane-to-lane passes leave both robots dodging. Route length and route discipline
-        trade against each other, and the default keeps the one that delivers.
+        The angle affects robot-vs-robot detection only: a rack is found by a straight
+        ray down the heading, deliberately <em>not</em> by the cone, so that a robot
+        aimed through a 50 px aisle does not read the flanking rack corners as a wall
+        ahead (<code>warehouse_sim.js</code>, <code>rayHitsRack</code>).
+        <br><br>
+        <strong>Router</strong> switches the path planner. <em>grid</em> plans over a
+        uniform 50 px lattice with Dijkstra, so its routes are 17% shorter and none of
+        its legs crosses a rack. <em>chain</em> is the original hand-built
+        corridor-and-aisle router and keeps every robot on three lanes; on three lanes
+        a meeting is reliably head-on and the priority election fires, whereas the
+        grid's ~20 lanes leave robots passing offset and both dodging, which is why
+        the chain arm delivered 36% more (1029 against 662) at the old defaults. Under
+        the new short-narrow-lidar defaults the grid arm wins instead (1555 against
+        1303), so the pair is worth comparing live rather than taken on trust.
       </p>
     </div>
   </section>
@@ -614,16 +628,26 @@ document.getElementById("sidestep").addEventListener("input", function () {
     unbounded ? "unbounded" : `${this.value} px`;
 });
 
-// Keep the cone slider's bounds tied to the sim's own constants rather than
-// restating them here, so the two cannot drift the way the lidar angle itself once
-// did (it was hard-coded at the scan site with no way to vary it at all).
+// Keep the lidar sliders' bounds and defaults tied to the sim's own constants rather
+// than restating them in the markup, so the two cannot drift the way the lidar angle
+// itself once did (it was hard-coded at the scan site with no way to vary it at all).
+// The markup still carries the values, so the panel reads correctly before this runs;
+// this makes the module the source of truth from then on.
 (() => {
-  const el = document.getElementById("lidarAngle");
-  if (!el) return;
-  el.min = Math.round(S.LIDAR_ANGLE_MIN * 180 / Math.PI);
-  el.max = Math.round(S.LIDAR_ANGLE_MAX * 180 / Math.PI);
-  el.value = Math.round(S.LIDAR_HALF_ANGLE * 180 / Math.PI);
-  document.getElementById("lidarAngleLabel").textContent = `${el.value}°`;
+  const angle = document.getElementById("lidarAngle");
+  if (angle) {
+    angle.min = Math.round(S.LIDAR_ANGLE_MIN * 180 / Math.PI);
+    angle.max = Math.round(S.LIDAR_ANGLE_MAX * 180 / Math.PI);
+    angle.value = Math.round(S.LIDAR_HALF_ANGLE * 180 / Math.PI);
+    document.getElementById("lidarAngleLabel").textContent = `${angle.value}°`;
+  }
+  const range = document.getElementById("lidar");
+  if (range) {
+    range.min = S.LIDAR_RANGE_MIN;
+    range.max = S.LIDAR_RANGE_MAX;
+    range.value = S.LIDAR_RANGE_DEFAULT;
+    document.getElementById("lidarLabel").textContent = `${range.value} px`;
+  }
 })();
 
 setInterval(decideTick, 100);   // cheap poll; per-robot lastAsk enforces the real interval
