@@ -143,3 +143,52 @@ test("an unblocked robot is offered everything", () => {
   assert.equal(probe.derived.goldAction, null);
   assert.equal(probe.violations.length, 0);
 });
+
+// ---- the deadlock escape ----------------------------------------------------
+//
+// The only axiom in this file that GRANTS an action instead of withdrawing one, so
+// it has two ways to be wrong and both are tested: granting `backward` to a robot
+// that is not deadlocked hands it a way to give up route for no reason, and
+// withholding it from a robot that is deadlocked leaves the robot with no move that
+// changes the geometry, which is the deadlock the axiom exists to break.
+
+test("a deadlocked robot is permitted to reverse, and only then", () => {
+  const { facts } = buildABox({ id: "R1" }, null, { deadlocked: true });
+  const probe = reason(facts);
+  assert.ok(probe.derived.permitted.includes("backward"),
+    `the escape was not admitted: [${probe.derived.permitted}]`);
+  assert.equal(probe.derived.deadlocked, true);
+  assert.equal(probe.violations.length, 0,
+    `the declaration contradicts itself: ${JSON.stringify(probe.violations)}`);
+});
+
+test("an ordinary blocked robot is not permitted to reverse", () => {
+  // The gate has to be the two clocks, not merely "is blocked". If `backward` leaked
+  // into the everyday set, every blocked robot could abandon its route instead of
+  // stepping around the obstacle, which is the behaviour the other four axioms spend
+  // their time shaping.
+  for (const c of collectBlockingScenes([1, 7], 3000)) {
+    const result = permittedActions(c.robot, c.scan, { stalled: c.stalled, deadlocked: false });
+    assert.ok(!result.options.includes("backward"),
+      `backward offered to a non-deadlocked robot (${c.kind}, stalled=${c.stalled})`);
+  }
+});
+
+test("the escape axiom rejects illegal backward in both directions", () => {
+  // Injected rather than observed, because neither state occurs naturally: the sim
+  // never grants `backward` to a moving robot, and never withholds it from a wedged
+  // one. A rule that cannot be made to fire is not being tested.
+  const scene = collectBlockingScenes([1], 1)[0];
+
+  const illegal = buildABox(scene.robot, scene.scan, { stalled: scene.stalled, deadlocked: false });
+  illegal.facts.individuals.get(scene.robot.id).permittedAction.add("backward");
+  const over = reason(illegal.facts);
+  assert.ok(over.violations.some(v => v.axiom === "deadlocked-robot-may-reverse"),
+    "granting backward to a non-deadlocked robot was not reported");
+
+  const missing = buildABox(scene.robot, scene.scan, { stalled: scene.stalled, deadlocked: true });
+  missing.facts.individuals.get(scene.robot.id).permittedAction.delete("backward");
+  const under = reason(missing.facts);
+  assert.ok(under.violations.some(v => v.axiom === "deadlocked-robot-may-reverse"),
+    "withholding backward from a deadlocked robot was not reported");
+});

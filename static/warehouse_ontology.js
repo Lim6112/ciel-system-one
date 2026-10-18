@@ -45,8 +45,23 @@ import {
 export const ACTION_SET = ["left", "stay", "right"];
 export const SIDESTEP_SET = ["left", "right"];
 
+// `backward` is NOT in ACTION_SET, and that is the point of the rule below rather
+// than an omission. It is a member of the action taxonomy -- a robot can do it, so it
+// is a class here -- but it is not part of the everyday choice, because reversing
+// gives up route the robot has already driven. It appears only where the other three
+// have been tried and failed, which is what the deadlock axiom states.
+export const ESCAPE_SET = ["backward"];
+// NO `stay`. A deadlocked robot is stalled by construction -- DEADLOCK_MS (8 s) is
+// longer than STALL_MS (4 s), so anything that can be deadlocked has already had
+// `stay` withdrawn -- and leaving it in produced a set that violated the
+// stalled-blocker axiom on every single deadlocked state. The first version did
+// include it, and the reason it looked right is that `stay` reads like a harmless
+// extra option; it is not, it is the option the whole escalation exists to remove.
+export const DEADLOCK_SET = ["backward", "left", "right"];
+
 export const VOCABULARY = {
-  classes: ["Robot", "Blocker", "StaticBlocker", "MobileBlocker", "Action"],
+  classes: ["Robot", "Blocker", "StaticBlocker", "MobileBlocker", "Action",
+            "DeadlockedRobot", "Backward"],
   properties: ["blockedBy", "permittedAction", "inDockZone", "goldAction"],
 };
 
@@ -125,6 +140,23 @@ export const TBOX = [
       "decoration: the rule exists to remove stay, and if removing it could empty the set " +
       "the robot would have no legal move at all.",
   },
+  {
+    id: "deadlocked-robot-may-reverse",
+    form: "range",
+    subject: "DeadlockedRobot",
+    property: "permittedAction",
+    value: ["backward", "left", "right"],
+    comment:
+      "Tier 1. A deadlocked robot -- stuck AND blocked for DEADLOCK_MS (8 s) -- is " +
+      "permitted to reverse, which no other state permits. This is the only axiom here " +
+      "that ADDS an action rather than removing one, so it is stated as a range rather " +
+      "than a disjointness: the other rules say what a robot may not do, and this one " +
+      "says what only this situation allows. `backward` is deliberately absent from " +
+      "ACTION_SET so that it cannot appear in the everyday choice; the range is what " +
+      "admits it. Reversing is not free -- it gives up route already driven -- which is " +
+      "why it is gated on the two clocks rather than offered whenever a robot is " +
+      "blocked.",
+  },
 ];
 
 /** Look an axiom up by id, so a violation can name the axiom it broke. */
@@ -152,10 +184,18 @@ export function buildABox(robot, scan, opts = {}) {
   const options = opts.feasibleOptions ?? feasibleOptions;
   const gold = opts.goldDirection ?? goldDirection;
   const roleOf = opts.headOnRole ?? headOnRole;
-  
+
   const stalled = !!opts.stalled;
   const blocked = !!scan;
   const staticBlocker = blocked && !!scan.rack;
+  // NOT gated on `blocked`, and that is the point rather than an oversight. A robot
+  // can be wedged with NOTHING in its lidar cone -- the hard collision check stops it
+  // at MIN_SEP while the blocker sits off to the side, which measured at 53.6% of all
+  // stuck-in-contact ticks. Gating this on `blocked` made the escape unreachable in
+  // the majority of the stalls it was added for, and the failure was quiet: the state
+  // was typed `Robot` with nothing to report, so nothing asked a question and no
+  // action could be chosen.
+  const deadlocked = !!opts.deadlocked;
 
   // The head-on role, so both halves of the rule see the same election. Computed
   // here rather than passed in, because the whole point is that the two robots
@@ -163,8 +203,8 @@ export function buildABox(robot, scan, opts = {}) {
   const role = blocked && !staticBlocker ? roleOf(robot, scan) : null;
 
   const permitted = blocked
-    ? options(staticBlocker ? "rack" : "robot", stalled, role)
-    : ACTION_SET;
+    ? (deadlocked ? DEADLOCK_SET : options(staticBlocker ? "rack" : "robot", stalled, role))
+    : deadlocked ? DEADLOCK_SET : ACTION_SET;
 
   const facts = { individuals: new Map() };
   const add = (id, type, props = {}) => {
@@ -172,13 +212,15 @@ export function buildABox(robot, scan, opts = {}) {
     return facts.individuals.get(id);
   };
 
-  const robotInd = add(robot.id, blocked ? "BlockedRobot" : "Robot", {
+  const robotInd = add(robot.id, deadlocked ? "DeadlockedRobot"
+    : blocked ? "BlockedRobot" : "Robot", {
     blocked,
     stalled,
+    deadlocked,
     // Empty set when nothing blocks — an empty permittedAction on a BlockedRobot
     // IS the violation, never inferred from "not blocked".
     permittedAction: new Set(permitted),
-    goldAction: blocked ? new Set([gold(scan, stalled, role)]) : new Set(),
+    goldAction: blocked ? new Set([gold(scan, stalled, role, deadlocked)]) : new Set(),
     // Recorded on the fact so the reasoner and the panel can both say which
     // robot the priority rule elected, rather than recomputing it.
     headOnRole: role,
@@ -224,14 +266,66 @@ export function reason(facts, { extensions = {} } = {}) {
   const kindRule = axiom("blocker-single-kind");
   const goldRule = axiom("blocked-robot-has-gold");
   const setRule = axiom("blocked-robot-has-permitted-set");
+  const escapeRule = axiom("deadlocked-robot-may-reverse");
 
   for (const [id, ind] of facts.individuals) {
-    if (ind.type !== "BlockedRobot") continue;
+    if (ind.type !== "BlockedRobot" && ind.type !== "DeadlockedRobot") continue;
+
+    // range: DeadlockedRobot ⊑ permittedAction ∈ the escape set.
+    //
+    // Checked in both directions, because this axiom is the file's only one that
+    // GRANTS an action rather than withdrawing one, and a grant has two ways to be
+    // wrong. A deadlocked robot that cannot reverse is stuck by construction; a robot
+    // that CAN reverse while not deadlocked has been handed a way to give up route it
+    // should not give up, which is the failure this gating exists to prevent. The
+    // second direction is also what keeps `backward` from leaking into the everyday
+    // option set through some later edit.
+    if (!escapeRule) {
+      if (!unasserted.includes("deadlocked-robot-may-reverse")) {
+        unasserted.push("deadlocked-robot-may-reverse");
+      }
+    } else {
+      const allowed = new Set(escapeRule.value);
+      for (const action of ind.permittedAction) {
+        if (action !== "backward") continue;
+        if (!ind.deadlocked) {
+          violations.push({
+            axiom: escapeRule.id,
+            subject: id,
+            detail: "permitted to reverse while not deadlocked — reversing gives up " +
+              "route, so it is only legal once the other moves have failed",
+          });
+        }
+      }
+      if (ind.deadlocked && !ind.permittedAction.has("backward")) {
+        violations.push({
+          axiom: escapeRule.id,
+          subject: id,
+          detail: "deadlocked but not permitted to reverse, so it has no move that " +
+            "changes the geometry — this is the deadlock the axiom exists to break",
+        });
+      }
+      for (const action of ind.permittedAction) {
+        if (!allowed.has(action)) {
+          violations.push({
+            axiom: escapeRule.id,
+            subject: id,
+            detail: `permitted action ${action} is outside the deadlock range`,
+          });
+        }
+      }
+    }
 
     // minCardinality: BlockedRobot ⊑ ≥1 goldAction
+    //
+    // This is a claim about GEOMETRY, so it only applies to a robot that has a
+    // blocker to compute geometry from. A deadlocked robot can have nothing in its
+    // cone at all, and asking "which action clears it" of a robot that can see
+    // nothing is a question with no answer rather than a missing one — reporting it
+    // as a violation would make the escape axiom's own state permanently inconsistent.
     if (!goldRule) {
       if (!unasserted.includes("blocked-robot-has-gold")) unasserted.push("blocked-robot-has-gold");
-    } else if (ind.goldAction.size < goldRule.value) {
+    } else if (ind.blocked && ind.goldAction.size < goldRule.value) {
       violations.push({
         axiom: goldRule.id,
         subject: id,
@@ -360,8 +454,17 @@ export function reason(facts, { extensions = {} } = {}) {
   // Any robot individual, blocked or not — an unblocked robot still has a
   // permitted-action set (all of them), and reading only the blocked type left
   // it reporting an empty one, i.e. a robot with no legal move.
+  //
+  // DeadlockedRobot is listed too, and leaving it out was a real bug rather than an
+  // oversight of style: a deadlocked robot is typed `DeadlockedRobot` INSTEAD of
+  // `BlockedRobot`, so this lookup found nothing, `derived.permitted` came back EMPTY,
+  // and `permittedActions` then fell back to the plain ACTION_SET. The escape was
+  // admitted by buildABox and silently dropped by the reasoner, so the option set for
+  // a wedged robot was exactly the one that had already failed. Caught by asserting
+  // that a deadlocked robot's set contains `backward`.
   const robot = [...facts.individuals.values()]
-    .find(i => i.type === "BlockedRobot" || i.type === "Robot") || null;
+    .find(i => i.type === "BlockedRobot" || i.type === "DeadlockedRobot" || i.type === "Robot")
+    || null;
   const derived = {
     goldAction: robot && robot.goldAction.size ? [...robot.goldAction][0] : null,
     permitted: robot ? [...robot.permittedAction] : [],
@@ -376,6 +479,9 @@ export function reason(facts, { extensions = {} } = {}) {
     // stalls soon after, and the no-role branch then answers a sidestep too), which
     // is why it was invisible: a latent bug, not an active one.
     headOnRole: robot ? robot.headOnRole ?? null : null,
+    // The deadlock flag, so a caller can build the right question from what the
+    // reasoner already decided rather than re-deriving the 8 s gate.
+    deadlocked: robot ? !!robot.deadlocked : false,
   };
 
   return { consistent: violations.length === 0, violations, unasserted, derived };
@@ -400,6 +506,7 @@ export function permittedActions(robot, scan, opts = {}) {
   const blocking = probe.violations.filter(v =>
     v.axiom === "static-blocker-disallows-stay" ||
     v.axiom === "stalled-blocker-disallows-stay" ||
+    v.axiom === "deadlocked-robot-may-reverse" ||
     v.axiom === "blocked-robot-has-permitted-set");
   const options = probe.derived.permitted;
   return {
@@ -407,6 +514,9 @@ export function permittedActions(robot, scan, opts = {}) {
     // Carried out so a caller can compute its own gold with the election this
     // reasoner applied, instead of deriving the two halves of the rule separately.
     headOnRole: probe.derived.headOnRole ?? null,
+    // And the deadlock flag, for the same reason: a caller that wants to build its
+    // question must not have to re-derive the gating the ontology just applied.
+    deadlocked: probe.derived.deadlocked ?? false,
     ok: blocking.length === 0,
     violations: blocking,
     allViolations: probe.violations,
@@ -423,14 +533,15 @@ export function permittedActions(robot, scan, opts = {}) {
  */
 export function aboxFor(sim) {
   if (!sim || !sim.robot) return [];
-  const { robot, scan, stalled = false } = sim;
-  const verdict = permittedActions(robot, scan, { stalled });
+  const { robot, scan, stalled = false, deadlocked = false } = sim;
+  const verdict = permittedActions(robot, scan, { stalled, deadlocked });
   const kind = !scan ? null : scan.rack ? "StaticBlocker" : "MobileBlocker";
   const rows = [{
     id: robot.id,
     detail: scan
       ? `blocked by ${kind}${scan.rack ? ` (${scan.rack.id})` : ""}` +
-        `${stalled ? ", stalled" : ""} · permitted ${verdict.options.join("/")}`
+        `${stalled ? ", stalled" : ""}${deadlocked ? ", DEADLOCKED" : ""}` +
+        ` · permitted ${verdict.options.join("/")}`
       : "not blocked · every action permitted",
     violations: verdict.violations,
     unasserted: verdict.unasserted,

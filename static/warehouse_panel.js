@@ -45,19 +45,25 @@ export function mountWarehousePanel({ root, getSim, onChange }) {
         if (!sim || !sim.robot) {
           return [{ ok: true, text: "no blocked robot yet — start the run" }];
         }
-        const { robot, scan, stalled } = sim;
-        if (!scan) {
+        const { robot, scan, stalled, deadlocked } = sim;
+        // A robot can be wedged with NOTHING in its cone -- the hard collision check
+        // stops it at MIN_SEP while the blocker sits off to the side. Reporting that
+        // as "not blocked, every action is permitted" was wrong before the escape
+        // existed and is actively misleading now, since it is the one state where the
+        // option set is unusual.
+        if (!scan && !deadlocked) {
           return [{ ok: true, text: `${robot.id} is not blocked, so every action is permitted` }];
         }
-        const kind = scan.rack ? "static obstacle" : "another robot";
-        const verdict = permittedActions(robot, scan, { stalled });
+        const kind = scan ? (scan.rack ? "static obstacle" : "another robot") : "nothing in the cone";
+        const verdict = permittedActions(robot, scan, { stalled, deadlocked });
         return [
           {
             ok: true,
-            text: `${robot.id} is blocked by a ${kind}; permitted: ` +
-              `${verdict.options.join(" / ")}` +
-              (stalled ? " (stalled, so wait is withdrawn)" : "") +
-              (scan.rack ? " (static, so wait was never offered)" : ""),
+            text: `${robot.id} is ${deadlocked ? "WEDGED" : "blocked"} by a ${kind}; ` +
+              `permitted: ${verdict.options.join(" / ")}` +
+              (deadlocked ? " (deadlocked, so reversing is admitted)" : "") +
+              (stalled && !deadlocked ? " (stalled, so wait is withdrawn)" : "") +
+              (scan && scan.rack ? " (static, so wait was never offered)" : ""),
           },
           ...verdict.violations.map(v => ({ ok: false, text: `${v.axiom}: ${v.detail}` })),
         ];
@@ -80,13 +86,18 @@ export function mountWarehousePanel({ root, getSim, onChange }) {
 }
 
 /** The permitted action set, as the decision loop sees it. */
-export function permittedFor(robot, scan, stalled) {
-  const verdict = permittedActions(robot, scan, { stalled });
+export function permittedFor(robot, scan, stalled, deadlocked = false) {
+  const verdict = permittedActions(robot, scan, { stalled, deadlocked });
   return {
     options: verdict.options.length ? verdict.options : ["left", "stay", "right"],
     // The election the reasoner actually applied, so the caller's displayed gold is
     // computed with the same role rather than a second, independent guess. See the
     // note on `derived.headOnRole` in warehouse_ontology.js.
     role: verdict.headOnRole ?? null,
+    // And whether the escape was admitted, so the caller builds its question and its
+    // gold from the same verdict rather than re-deriving the gate. The two drifting
+    // apart is the failure mode this whole arrangement exists to prevent.
+    deadlocked: verdict.deadlocked ?? false,
+    violations: verdict.violations,
   };
 }

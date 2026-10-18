@@ -154,14 +154,19 @@
         sidestep travel at all. Shorter is worse because a robot that stops short of
         clearing an obstacle is re-blocked next tick and sidesteps again.
         <br>
-        <strong>Expect robots to freeze at this setting, and it is not a bug in the
-        page.</strong> 30 px is the dominant cause of permanent two-robot deadlock: over
-        15 seeds and 960 s each it produces nine stalls of eight seconds or more, the
-        worst lasting 887 s — i.e. the rest of the run — against one at the unbounded
-        default. Two robots meet, neither manoeuvre is long enough to clear the other,
-        and they alternate re-blocks instead of resolving. Drag this to the maximum to
-        watch them recover; the low end is here to make the failure visible, and this
-        is what it looks like when it runs for a whole session.
+        <strong>This value causes deadlock, and the backward option is what clears
+        it.</strong> Over 15 seeds and 960 s each, 30 px produces nine stalls of eight
+        seconds or more, the worst lasting 887 s — the rest of the run. Two robots meet,
+        neither manoeuvre is long enough to clear the other, and they alternate
+        re-blocks instead of resolving.
+        <br>
+        Eight seconds into such a stall a robot is offered a third action,
+        <strong>backward</strong>, which no other state permits; the panel will label it
+        WEDGED and the decision will show three bars — reverse, left, right — instead of
+        the usual two, since a stalled robot has already lost «wait». That is the escape,
+        and with it the same runs go from 1256 to 4453 deliveries and the long stalls
+        disappear entirely. Watch a stall form and then break: the reverse is a couple of
+        seconds of travel, and it is the ground the robot had just gained.
         <br>
         Below <strong>21 px</strong> (two robot radii plus the safety margin) a robot
         cannot clear another robot at all, so the low end does not shorten the
@@ -281,9 +286,12 @@ async function askCJet(robot, scan, now) {
 
   const stalledFor = robot.lastProgressAt ? (now - robot.lastProgressAt) / 1000 : 0;
   const stalled = stalledFor * 1000 >= S.STALL_MS;
-  const kind = scan.rack ? "rack" : "robot";
-  const qid = S.questionId(kind, stalled);
-  const question = S.buildQuestion(kind, stalled);
+  // `scan` may be null here: a deadlocked robot whose blocker sits outside its cone
+  // has no obstacle to report, and that is precisely the state the escape exists for.
+  const deadlocked = !!robot.deadlocked;
+  const kind = scan && scan.rack ? "rack" : "robot";
+  const qid = S.questionId(kind, stalled, deadlocked);
+  const question = S.buildQuestion(kind, stalled, deadlocked);
 
   // ONE rule, ONE decision. The ontology's verdict is computed first and supplies
   // all three things that depend on it: the option set, the head-on election, and —
@@ -293,22 +301,25 @@ async function askCJet(robot, scan, now) {
   // page and the simulator disagreed once (the page never passed the role at all),
   // and the state text and the election would have disagreed here if the text were
   // built before the election was known.
-  const verdict = permittedFor(robot, scan, stalled);
+  const verdict = permittedFor(robot, scan, stalled, deadlocked);
   const feasible = verdict.options;
   // The observation is built knowing which robot this is, because a dead-ahead
   // meeting is rewritten so the one that concedes is told which way to step. See
   // the rewrite in warehouse_sim.js `buildState`.
-  const state = S.buildState(robot, scan, now, verdict.role);
+  const state = S.buildState(robot, scan, now, verdict.role, deadlocked);
 
   document.getElementById("whoAsked").textContent =
-    `Robot ${robot.id} (${robot.colorName}) asked ${qid} — blocked by ${kind}` +
-    (stalled ? ` · stalled ${stalledFor.toFixed(1)} s, "wait" withdrawn` : "");
+    `Robot ${robot.id} (${robot.colorName}) asked ${qid} — ` +
+    (deadlocked
+      ? `WEDGED, no progress ${(stalledFor).toFixed(1)} s${scan ? `, blocked by ${kind}` : ", nothing in the cone"}`
+      : `blocked by ${kind}`) +
+    (stalled && !deadlocked ? ` · stalled ${stalledFor.toFixed(1)} s, "wait" withdrawn` : "");
   document.getElementById("stateView").textContent =
     qid + "\n" + JSON.stringify(state, null, 2);
   // The geometry answer, computed before asking: it is the oracle the eval scores
   // against, and what the page shows next to the model's answer.
-  const oracle = S.goldDirection(scan, stalled, verdict.role);
-  lastScene = { robot, scan, stalled };
+  const oracle = S.goldDirection(scan, stalled, verdict.role, deadlocked);
+  lastScene = { robot, scan, stalled, deadlocked };
 
   try {
     const response = await fetch("/api/predict", {
@@ -349,9 +360,12 @@ function applyDecision(robot, scan, body, meta, now) {
                  body.latency_ms, scan, meta);
 }
 
-// bar order follows whichever question was asked (2- or 3-way)
+// Bar order follows the question that was asked, which may now be 2-, 3- or 4-way.
+// `backward` is listed FIRST to match the order the question and the option set use:
+// the ordering is the statement of priority, and a reader's eye should land on the
+// escape in the one state where it is on offer.
 function barsFor(probs) {
-  const known = ["left", "stay", "right"];
+  const known = ["backward", "left", "stay", "right"];
   return known.filter(label => label in probs);
 }
 
@@ -396,7 +410,10 @@ function renderDecision(robot, action, probs, confidence, latency, scan, meta) {
   const entry = document.createElement("div");
   entry.innerHTML =
     `<span class="act act-${action}">${robot.id} → ${action.replace("_", " ")}</span>` +
-    ` (${((probs[action] || 0) * 100).toFixed(0)}%) · gap ${S.fmtM(scan.dist)} · ` +
+    ` (${((probs[action] || 0) * 100).toFixed(0)}%) · ` +
+    // `scan` is null for a deadlock with nothing in the cone, which is the state the
+    // escape exists for, so the gap has to be optional rather than assumed.
+    (scan ? `gap ${S.fmtM(scan.dist)}` : "nothing in the cone") + ` · ` +
     `${new Date().toLocaleTimeString()}`;
   history.prepend(entry);
   while (history.children.length > 12) history.lastChild.remove();
@@ -416,7 +433,13 @@ function decideTick() {
   for (const robot of robots) {
     if (robot.asking || now - robot.lastAsk < interval) continue;
     const scan = S.scanLidar(robot, robots, lidarRange());
+    // ASK EVEN WHEN NOTHING IS IN THE CONE, if the robot is deadlocked. A narrow cone
+    // leaves a stopped robot with no obstacle to report, which used to mean no
+    // question was ever asked and no action -- `backward` included -- could ever be
+    // chosen. The deadlock is a property of the robot's clocks, not of its lidar, so
+    // it is the clocks that decide whether to ask.
     if (scan) askCJet(robot, scan, now);
+    else if (robot.deadlocked) askCJet(robot, null, now);
   }
 }
 

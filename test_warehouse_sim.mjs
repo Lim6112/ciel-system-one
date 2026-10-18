@@ -22,7 +22,12 @@ import {
   buildState,
   createWorld,
   dockZoneOpen,
+  DEADLOCK_MS,
+  LIDAR_HALF_ANGLE,
+  backwardVelocity,
   feasibleOptions,
+  feasibleOptionsWithEscape,
+  isDeadlocked,
   goldDirection,
   headOnRole,
   headingIn,
@@ -711,4 +716,51 @@ test("createWorld is deterministic for a given seed", () => {
   assert.deepEqual(a, b);
   const c = createWorld(43).map(r => [r.id, r.x, r.y, r.pickupRack.id]);
   assert.notDeepEqual(a, c);
+});
+
+// ---- the deadlock escape ----------------------------------------------------
+
+test("the escape is offered on the clocks, not on the lidar", () => {
+  // The failure this guards against: a wedged robot whose blocker sits outside its
+  // cone has `scan === null`, so gating the option on "is there an obstacle" leaves
+  // it with no move at all -- measured at 53.6% of stuck-in-contact ticks. The gate
+  // has to be the two clocks.
+  assert.equal(isDeadlocked(0, 0), false, "offered before anything had failed");
+  assert.equal(isDeadlocked(DEADLOCK_MS - 1, DEADLOCK_MS), false, "offered one tick early");
+  assert.equal(isDeadlocked(DEADLOCK_MS, DEADLOCK_MS - 1), false, "offered while not blocked");
+  assert.equal(isDeadlocked(DEADLOCK_MS, DEADLOCK_MS), true, "not offered when wedged");
+  // And the escape must be strictly harder to reach than the stalled escalation, or
+  // a robot would be handed the route-giving-up move before `stay` was even withdrawn.
+  assert.ok(DEADLOCK_MS > STALL_MS,
+    `stalled escalation (${STALL_MS}) must come first, deadlock (${DEADLOCK_MS}) after`);
+});
+
+test("a deadlocked robot gets the escape and a normal one does not", () => {
+  const robot = { id: "R1", x: 260, y: 158, heading: Math.PI / 2 };
+  const others = [{ id: "R2", x: 300, y: 158, heading: 0 }];
+  const scan = scanLidar(robot, [robot, ...others], 70, LIDAR_HALF_ANGLE);
+
+  const normal = feasibleOptionsWithEscape("robot", true, null, false);
+  assert.ok(!normal.includes("backward"), `leaked into the ordinary set: [${normal}]`);
+
+  const wedged = feasibleOptionsWithEscape("robot", true, null, true);
+  assert.ok(wedged.includes("backward"), `escape missing: [${wedged}]`);
+  // It leads, so the priority is readable from the option order alone.
+  assert.equal(wedged[0], "backward");
+  // ...and `stay` is still withdrawn: a deadlocked robot has been stalled for longer
+  // than STALL_MS by definition, so offering wait again would be offering the option
+  // that already failed. This was wrong in the first version of the deadlock set.
+  assert.ok(!wedged.includes("stay"), `wait re-offered to a wedged robot: [${wedged}]`);
+});
+
+test("the escape reverses along the incoming heading", () => {
+  // Reversing means retreating from whatever is in front, so the velocity must be the
+  // negation of the heading vector -- not a rotation to some other axis.
+  for (const heading of [0, Math.PI / 2, Math.PI, -Math.PI / 3]) {
+    const robot = { heading };
+    const v = backwardVelocity(robot, 80);
+    const forward = { x: Math.cos(heading) * 80, y: Math.sin(heading) * 80 };
+    assert.ok(Math.abs(v.vx + forward.x) < 1e-9 && Math.abs(v.vy + forward.y) < 1e-9,
+      `heading ${heading}: ${JSON.stringify(v)} is not the reverse of ${JSON.stringify(forward)}`);
+  }
 });

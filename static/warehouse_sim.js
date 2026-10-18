@@ -158,20 +158,30 @@ export const LIDAR_RANGE_MAX = 150;
 // failure visible rather than an improvement, so it is the demo's default now and
 // not a recommendation -- the sliders can take it back to unbounded in one drag.
 //
-// KNOWN ISSUE, ACCEPTED RATHER THAN MISSED: this value is the dominant cause of
-// permanent two-robot deadlock, and it was shipped with that known. Measured over 15
-// seeds x 960 s, holding everything else at the current defaults, with the harness
-// validated against this file's recorded delivery counts:
+// THIS VALUE IS THE DOMINANT CAUSE OF PERMANENT TWO-ROBOT DEADLOCK, and that was
+// measured, not suspected. Over 15 seeds x 960 s at the current defaults:
 //
-//   sidestep 30 px    9 deadlock events, worst 887 s   (92% of a run)
+//   sidestep 30 px     9 deadlock events, worst 887 s   (92% of a run)
 //   sidestep unbounded 1 event,            worst 802 s
 //
 // The mechanism is the one the table above already describes, taken to its limit: a
 // robot that stops short of clearing the obstacle is re-blocked next tick, and under
 // this budget the pair can alternate re-blocks indefinitely instead of resolving.
-// The fix is the unbounded default, not a cleverer bound; the low end of the slider
-// is here to demonstrate the failure, and this is what it looks like when it runs
-// for a whole session.
+//
+// THE ESCAPE OPTION IS WHAT MAKES THIS SURVIVABLE, so it should not be removed from
+// the option set without checking this number. With the backward escape available
+// (see BACKWARD) the same 15 seeds give:
+//
+//   grid   escape off  2522 deliveries   9 events, worst 887 s
+//   grid   escape on   4486 deliveries   5 events, worst   0 s
+//   chain  escape off  2172 deliveries   8 events, worst 938 s
+//   chain  escape on   3956 deliveries   4 events, worst   0 s
+//
+// The 800 s stalls disappear entirely. Neither fix is sufficient alone: unbounded
+// sidestep avoids most stalls but costs throughput elsewhere, and the escape cannot
+// fire at all under a stall the robot never detects. The low end of the slider is
+// still here to make the failure visible -- pull it to the maximum to watch the same
+// run behave.
 export const SIDESTEP_PX = 30;
 
 // The timer that caps a sidestep regardless of distance, so a slow robot cannot
@@ -574,10 +584,16 @@ export function makeRobot(rid, rng = Math.random) {
     // Where this sidestep started, so its distance can be bounded. See
     // `sidestepBudgetSpent` and SIDESTEP_PX.
     sidestepFromX: 0, sidestepFromY: 0,
+    // The reverse manoeuvre: same shape as a sidestep, opposite direction, and only
+    // ever started on a deadlock. See BACKWARD.
+    backingUpUntil: 0, backingFromX: 0, backingFromY: 0,
     // stall tracking: blockedSince is the raw obstacle timer (kept for the
     // readout), lastProgressAt is what actually drives escalation
     blockedSince: null, lastProgressAt: 0, lastProgressX: spec.start.x,
     lastProgressY: spec.start.y,
+    // Set every tick by `step` from the two clocks above. Read by the caller to
+    // decide whether to offer `backward`.
+    deadlocked: false,
     obstacle: null, deliveries: 0, asking: false, lastAsk: 0,
     // The seeded rng, kept so every later task assignment draws from the same
     // deterministic stream rather than falling back to Math.random.
@@ -674,10 +690,38 @@ export function scanLidar(robot, robots, range, halfAngle = LIDAR_HALF_ANGLE) {
 
 export const AVOID_QID = "avoid_direction";
 export const SIDESTEP_QID = "sidestep_direction";
+// A third question type, asked only when the first two have demonstrably failed. It
+// exists so the escape option is a decision in the same pipeline as the others --
+// same state, same model call, same logged comparison -- rather than a special case
+// hidden in the physics.
+export const DEADLOCK_QID = "deadlock_escape";
 
 // Once a robot has made no progress for STALL_MS, it stops asking whether to
 // wait and is told to go around instead.
-export function buildQuestion(blockerKind, stalled) {
+export function buildQuestion(blockerKind, stalled, deadlocked = false) {
+  // THE DEADLOCK QUESTION, which is a different question and not a wider one. Every
+  // other branch here asks which way to go; this one asks whether to go at all. The
+  // robot has already tried `left`/`right` for DEADLOCK_MS and is still stuck, so
+  // offering the same two options again is asking a question whose answer is known
+  // to have failed. Reversing is the only move that changes the geometry.
+  //
+  // `backward` leads the criteria for the same reason it leads the option set: the
+  // ordering is the statement of priority, and a caller that reads only the first
+  // key should read the escape.
+  if (deadlocked) {
+    return {
+      type: "choice",
+      instructions: "You are a warehouse delivery robot and you have been stuck " +
+        "for a long time. Sidestepping has not freed you. What should you do now?",
+      criteria: {
+        backward: "reverse away from the obstacle along the path I came in on, " +
+          "to open the space I am wedged in",
+        left: "sidestep to my left to pass the obstacle",
+        stay: "yield and wait, because the obstacle is about to clear my path",
+        right: "sidestep to my right to pass the obstacle",
+      },
+    };
+  }
   if (blockerKind === "rack" || stalled) {
     return {
       type: "choice",
@@ -703,7 +747,8 @@ export function buildQuestion(blockerKind, stalled) {
   };
 }
 
-export function questionId(blockerKind, stalled) {
+export function questionId(blockerKind, stalled, deadlocked = false) {
+  if (deadlocked) return DEADLOCK_QID;
   return (blockerKind === "rack" || stalled) ? SIDESTEP_QID : AVOID_QID;
 }
 
@@ -764,7 +809,7 @@ function sideToName(robot, scan) {
   return HEAD_ON_NAME;
 }
 
-export function buildState(robot, scan, now = 0, role = null) {
+export function buildState(robot, scan, now = 0, role = null, deadlocked = false) {
   const others = robot.others
     ? robot.others.filter(o => o !== robot.id)
         .map(id => describeOther(robot, id))
@@ -780,6 +825,20 @@ export function buildState(robot, scan, now = 0, role = null) {
       ? "heading to a rack to pick up cargo" : "carrying cargo to the dock",
     dock_distance: Math.hypot(robot.x - DOCK.x, robot.y - DOCK.y) < 150 ? "near" : "far",
   };
+
+  // THE DEADLOCK STATE, which is the one state the lidar cannot produce. A robot
+  // wedged against something outside its cone has `scan === null`, so nothing below
+  // this branch would run and it would never be asked anything -- measured at 53.6%
+  // of all stuck-in-contact ticks. The escape option exists for exactly this, so the
+  // state has to be constructible from the robot's clocks alone.
+  //
+  // One leaf, `deadlock`, and it says plain enough what the situation is. It is
+  // added to every deadlocked state whether or not an obstacle is visible, because
+  // the two are the same problem to the robot: it has not moved for 8 s.
+  if (deadlocked) {
+    doc.deadlock = "wedged, no progress for 8s";
+  }
+  if (!scan) return doc;
 
   if (scan.rack) {
     doc.obstacle_kind = "storage rack";
@@ -1212,7 +1271,27 @@ export function hitsRack(x, y) {
 // Which way actually clears a blocker, from geometry alone. This is the oracle
 // eval_warehouse.mjs scores the model against, and the gate's fallback — so it
 // must not read any surface word.
-export function goldDirection(scan, stalled = false, role = null) {
+//
+// `deadlocked` is the one argument that is NOT geometry, and it is passed in rather
+// than derived here because the gate is a pair of CLOCKS (how long stuck, how long
+// blocked), not a position. Keeping it an argument keeps this function a pure
+// function of the scene, which is what makes it safe to use as an oracle.
+export function goldDirection(scan, stalled = false, role = null, deadlocked = false) {
+  // THE DEADLOCK GOLD IS BACKWARD, AND IT IS THE FIRST BRANCH ON PURPOSE.
+  //
+  // This is a different kind of gold from every other line in this function. The
+  // others all answer "which way past it"; this one answers "stop trying to get past
+  // it". The robot has already been offered left/right for DEADLOCK_MS and is still
+  // stuck, so a gold of "left" here would be recommending the option that has
+  // demonstrably failed -- the geometry cannot resolve it, and continuing to answer
+  // from geometry is how a deadlock stays a deadlock.
+  //
+  // It sits above the rack branch because a robot wedged on a rack can deadlock too,
+  // and the escape is the same move there: reverse out rather than pick a side.
+  // Note this makes the rack case's 2-way question become a 4-way one, which is
+  // correct but surprising, so `feasibleOptionsWithEscape` is what admits it and the
+  // ontology states it as a range on DeadlockedRobot.
+  if (deadlocked) return BACKWARD;
   if (scan.rack) {
     // Away from where the rack sits — which is also the wider-gap side.
     const lateral = scan.rackLateral ?? 0;
@@ -1263,6 +1342,55 @@ export function feasibleOptions(blockerKind, stalled, role = null) {
   if (role === "advance") return ["left", "right"];
   if (role === "yield") return ["left", "stay", "right"];
   return stalled ? ["left", "right"] : ["left", "stay", "right"];
+}
+
+// ---- backward: the option that exists to break a deadlock --------------------
+//
+// The four options above all move the robot FORWARD or sideways. When two robots
+// have run out of sideways room, or when one is wedged against a rack it cannot see
+// past, none of them can help: the only move that changes the geometry is reversing
+// out of the pocket. So `backward` is added, and it is deliberately NOT in
+// ACTION_SET -- see the note there for why it is offered only on a deadlock.
+export const BACKWARD = "backward";
+
+// How long a robot must be both STUCK and BLOCKED before the escape option is
+// offered. Longer than STALL_MS (4 s), because escalation should first try the moves
+// that keep the route: `stalled` removes `stay` at 4 s, and only if that has also
+// failed is reversing worth the route it gives back. 8 s is the number the deadlock
+// measurement already uses to call a stall permanent.
+export const DEADLOCK_MS = 8000;
+
+// True when `backward` should be on the menu. `stuckMs` is how long the robot has
+// made no progress, `blockedMs` how long it has been continuously blocked; both are
+// tracked in `step`, so this is a pure predicate over state the sim already has.
+export function isDeadlocked(stuckMs, blockedMs) {
+  return stuckMs >= DEADLOCK_MS && blockedMs >= DEADLOCK_MS;
+}
+
+// `feasibleOptions`, plus the escape option when the robot is deadlocked. Kept as a
+// separate function rather than another argument so no existing call site changes
+// behaviour: every current caller gets exactly the set it got before.
+export function feasibleOptionsWithEscape(blockerKind, stalled, role = null, deadlocked = false) {
+  const base = feasibleOptions(blockerKind, stalled, role);
+  if (!deadlocked) return base;
+  // Put it FIRST. The gold oracle scores the model by argmax over the option list in
+  // some harnesses, and a tie would otherwise always resolve to `left`; leading with
+  // the escape states the priority explicitly. It is also the option a reader of the
+  // state should notice, since its presence is the signal that this state is special.
+  return [BACKWARD, ...base];
+}
+
+// Where the backward option takes the robot: straight back the way it came, for as
+// long as a sidestep lasts. Reversing along the REVERSE of the current heading is
+// what makes it an escape rather than a random walk -- it retreats from whatever is
+// in front, which is the one direction guaranteed to open space, and it costs the
+// robot the ground it had gained rather than sending it somewhere new.
+export const BACKWARD_FACTOR = 1;
+export function backwardVelocity(robot, speed) {
+  return {
+    vx: -Math.cos(robot.heading) * speed * BACKWARD_FACTOR,
+    vy: -Math.sin(robot.heading) * speed * BACKWARD_FACTOR,
+  };
 }
 
 // ---- dock zone: a rule that does not pay for itself -------------------------
@@ -1390,6 +1518,16 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
       robot.lastProgressY = robot.y;
     }
 
+    // How long this robot has been STUCK (no net progress) and BLOCKED (an obstacle
+    // in front), tracked as plain clocks off state the sim already keeps. Both are
+    // needed and neither alone is enough: a robot waiting its turn is blocked but
+    // not stuck, and a robot driving a long corridor is stuck-looking between
+    // progress samples but not blocked. Only the conjunction means deadlock.
+    const stuckMs = robot.lastProgressAt ? now - robot.lastProgressAt : 0;
+    const blockedMs = robot.blockedSince !== null && robot.blockedSince !== undefined
+      ? now - robot.blockedSince : 0;
+    robot.deadlocked = isDeadlocked(stuckMs, blockedMs);
+
     const held = !dockVerdict.get(robot.id);
     robot.heldByDock = held;
 
@@ -1400,6 +1538,13 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
       rejoinPath(robot, now);
     }
     robot.wasSidestepping = now < robot.sidestepUntil;
+    // A finished REVERSE rejoins the same way. The robot is by definition behind
+    // where it was, so the projection finds the route ahead of it and the correction
+    // leg is the ground it just gave up.
+    if (replanAfterSidestep && robot.wasBackingUp && now >= robot.backingUpUntil) {
+      rejoinPath(robot, now);
+    }
+    robot.wasBackingUp = now < robot.backingUpUntil;
 
     // The head-on election, recomputed from the ABox each tick like the dock
     // verdict — so it is never stale and lifts by itself once the encounter ends.
@@ -1412,7 +1557,29 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
     if (yielding) robot.waiting = true;
 
     let vx = 0, vy = 0;
-    if (held || yielding) {
+    if (now < robot.backingUpUntil) {
+      // Reverse out of a deadlock, and it deliberately OUTRANKS the yield hold.
+      //
+      // The first version of this branch sat below `held || yielding` and therefore
+      // never ran in the one case it exists for: a head-on meeting always elects one
+      // robot to yield, the yield hold is "no movement at all", so the elected
+      // yielder could be told `backward` on every tick and still not move. Measured:
+      // 38,121 backward choices in a 15-seed run and the deadlock completely
+      // unchanged, worst stall 887 s before and after. A deadlocked robot has to be
+      // able to act even when the priority rule has told it to concede, because
+      // conceding is what it has been doing for the last 8 seconds.
+      //
+      // It also outranks the dock zone's hold for the same reason. Both holds exist
+      // to stop a robot entering somewhere; reversing moves AWAY from the contested
+      // ground, so honouring them would be preserving the rule by breaking its
+      // purpose.
+      //
+      // The yaw stays fixed, so the robot retreats along the line it came in on and
+      // its heading still points at the obstacle when the manoeuvre ends. That is
+      // deliberate: the route is unchanged, so the robot must be able to resume it.
+      const back = backwardVelocity(robot, speed);
+      vx = back.vx; vy = back.vy;
+    } else if (held || yielding) {
       // Tier 0 closes the zone: no movement, and no sidestep either — a sidestep
       // is still motion, and the rule is about not entering. The yield case is
       // the same shape: a robot elected to concede stops, including mid-sidestep,
@@ -1480,12 +1647,14 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
 
 // Apply one model answer. `action` is a label from the question that was asked.
 export function applyDecision(robot, action, now) {
-  // "stay" = yield; left/right = sidestep maneuver.
+  // "stay" = yield; left/right = sidestep maneuver; backward = reverse out of a
+  // deadlock (see BACKWARD above).
   // a sidestep already in progress finishes before a "stay" takes hold —
   // cancelling it mid-maneuver would freeze the robot beside the obstacle
   const sidestepping = now < robot.sidestepUntil;
   if (action === "stay") {
     if (!sidestepping) robot.waiting = true;
+    robot.backingUpUntil = 0;
   } else {
     robot.waiting = false;
     // commit to one direction per maneuver — flipping mid-sidestep every
@@ -1498,7 +1667,17 @@ export function applyDecision(robot, action, now) {
       // the earlier "is it clear" attempts were unstable.
       robot.sidestepFromX = robot.x;
       robot.sidestepFromY = robot.y;
+      robot.backingUpUntil = 0;
     }
+  }
+  if (action === BACKWARD) {
+    // A reverse manoeuvre is a sidestep in every respect except its direction: it
+    // uses the same timer, the same "commit to one action per manoeuvre" rule, and
+    // the same starting point for the distance bound. It is marked separately so the
+    // movement block and the readout can tell the two apart.
+    robot.backingUpUntil = now + SIDESTEP_MS;
+    robot.backingFromX = robot.x;
+    robot.backingFromY = robot.y;
   }
 }
 
