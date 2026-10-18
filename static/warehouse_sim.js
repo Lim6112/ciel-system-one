@@ -72,6 +72,18 @@ export const LIDAR_HALF_ANGLE = 45 * Math.PI / 180;
 // lateral offset, so the one signal the robot-blocks use does not exist for them.
 // What would work is deciding the exit distance ONCE, at decision time, from the
 // blocker then in front, and holding it for the manoeuvre — not re-deriving it.
+//
+// A FOURTH ATTEMPT ALSO FAILED, and it was the one that looked arithmetic-proof:
+// just shorten the timer. 1500 ms gives ~119 px, six times the MIN_SEP (21 px) a
+// robot needs, so 600 ms looked like a free 2.5x saving with the bound worked out
+// as "24 px at the slowest slider speed, still over MIN_SEP".
+//
+// Deliveries went 226 -> 17 and 222,767 ticks went to robots standing blocked.
+// The arithmetic was about the wrong distance: MIN_SEP is how far apart two robots
+// must stay, not how far one must travel to stop being in the way. Clearing a rack
+// means leaving the aisle the rack bounds, and clearing a robot that is also moving
+// means out-running its approach — neither is 24 px. 1500 ms is not obviously wrong
+// for what it is doing; it was the justification for shortening it that was.
 export const SIDESTEP_MS = 1500;
 
 // Escalation: how long a robot may make NO forward progress before it stops
