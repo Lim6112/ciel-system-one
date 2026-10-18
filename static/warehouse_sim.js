@@ -84,6 +84,28 @@ export const LIDAR_HALF_ANGLE = 45 * Math.PI / 180;
 // means leaving the aisle the rack bounds, and clearing a robot that is also moving
 // means out-running its approach — neither is 24 px. 1500 ms is not obviously wrong
 // for what it is doing; it was the justification for shortening it that was.
+//
+// A FIFTH ATTEMPT SWEPT THE BUDGET DIRECTLY, and the result says the target is wrong
+// rather than the method. A distance budget decided once at decision time (the shape
+// the four earlier failures pointed at) was swept over seven seeds:
+//
+//   budget     sidestep/배송 vs baseline    배송 vs baseline
+//   infinite             100%                    100%
+//       80px             104%                    111%
+//       60px             128%                     59%
+//       45px             226%                     11%
+//       30px              91%                     42%
+//
+// No budget reduces sidestep travel, and shorter is WORSE, not better. The reason is
+// the one that defeats every attempt at this: a robot that stops short of clearing
+// the obstacle is re-blocked on the next tick and sidesteps AGAIN, so a shorter
+// manoeuvre buys more manoeuvres. Distance travelled per delivery rises while
+// nobody clears anything. 1500 ms is not waste to be trimmed; it is what it takes
+// for one sidestep to be enough.
+//
+// So the swerving is not a tunable surplus. If it is to come down, the route has to
+// stop putting robots head-on in the first place — which is a planning change, not a
+// manoeuvre change. Five attempts to fix it in the manoeuvre are recorded above.
 export const SIDESTEP_MS = 1500;
 
 // Escalation: how long a robot may make NO forward progress before it stops
