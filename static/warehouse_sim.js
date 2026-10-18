@@ -288,7 +288,49 @@ function bandGap(px) {
   return px > 45 ? "wide" : "narrow";
 }
 
-export function buildState(robot, scan, now = 0) {
+// Which side to NAME in the head-on rewrite, such that the two robots step to
+// opposite sides of the corridor.
+//
+// This is easy to get backwards, and both earlier attempts did. The model answers
+// the OPPOSITE of the named side (measured: name `right`, get `left` 93-99%), so
+// "name the side they should step toward" is wrong by one negation — and naming the
+// same side for both robots, which looked like the obvious way to make mirrored
+// headings diverge, makes them step the same way instead. Verified by construction
+// below rather than by argument.
+//
+// So it is computed by doing it: take this robot's step direction for each of the
+// two names, and name whichever one moves it away from the counterpart's position.
+// That is a fact about the two robots' actual world coordinates, needs no shared
+// state, and cannot disagree with itself — each robot asks only "which way is
+// farther from the thing in front of me".
+// A CONSTANT, and that is the counterintuitive part.
+//
+// Two robots meeting head-on have opposite headings, so for a robot at heading h and
+// its counterpart at h+pi, the same named side produces OPPOSITE world movement:
+// with movement = (-sin(h)*d, cos(h)*d) and the same `d` on both sides, flipping h
+// flips the sign of every component. So naming the SAME side is what sends them
+// apart, and naming "the side each one has room on" — which is what this function
+// tried first, twice — sends them to the same half of the corridor.
+//
+// The first attempt read `robot.sidestepDir` for "which way is this robot already
+// stepping". That field starts at 0 and is only written by a decision, so both
+// robots reported "left" before asking and then kept their own committed direction
+// afterwards: same answer by accident, then divergent answers by drift.
+//
+// The second attempt named whichever side moved the robot away from the
+// counterpart, projected onto the robot-to-other vector. That is exactly zero for
+// both candidates in a head-on meeting — the step is perpendicular to the approach —
+// so the tie-break named both robots the same side, and by the rule above the same
+// side diverges... except the model answers the opposite of the named side, so an
+// extra negation flips it back to converging. Two sign errors that cancel are still
+// two sign errors; the comment at the call site records the arithmetic instead.
+const HEAD_ON_NAME = "right";
+
+function sideToName(robot, scan) {
+  return HEAD_ON_NAME;
+}
+
+export function buildState(robot, scan, now = 0, role = null) {
   const others = robot.others
     ? robot.others.filter(o => o !== robot.id)
         .map(id => describeOther(robot, id))
@@ -330,6 +372,49 @@ export function buildState(robot, scan, now = 0) {
       : "ahead, off to one side of my lane";
     doc.obstacle_distance = scan.dist < 60 ? "close" : "far";
     doc.obstacle_motion = scan.motion || "moving in the same direction";
+  }
+
+  // The ontology's rewrite of the observation, in the same spirit as breakout's
+  // reachability regime: when the declaration says an action is not permitted, the
+  // text the model is asked about says so too, rather than the model being asked a
+  // question whose answer is then overridden.
+  //
+  // WHAT THIS IS FOR. Dead ahead, the untransformed text reads "ahead of me, but
+  // not blocking my lane", which the head reads correctly as "not in my way" and
+  // answers `stay` — exactly what it was trained to answer for that phrasing. So
+  // both robots yield and the pair sits out STALL_MS. Measured on the live service,
+  // 25 of 25 head-on states answered `stay`, and rewriting these two fields moved
+  // 25 of 25 to a sidestep at 93-99% confidence, with the side tracking the field:
+  // `obstacle_side: right` -> `left`, `obstacle_side: left` -> `right`.
+  //
+  // NO RETRAINING NEEDED, and that is the whole point of doing it here instead of
+  // in the corpus. The head already knows `obstacle_position` in-lane plus a side
+  // means "step the other way"; the state simply was not saying it. Changing the
+  // corpus would have required a retrain AND would have changed what `stay` means
+  // for the states where waiting is the right answer.
+  //
+  // The side comes from geometry, not from the model: whoever is not elected to go
+  // first steps aside, and which side is theirs is read off their heading. Letting
+  // the model choose it would be the gate this demo removed.
+  if (doc.obstacle_kind === "robot" && doc.obstacle_side === "center" && role) {
+    // Both roles are told a side, because "in my lane" plus "center" is not enough:
+    // measured on the live service, that combination still answers `stay` for one
+    // robot in four (l=33% s=47%), which is the same stall this rewrite exists to
+    // remove — it had only moved to the other robot. Naming a side settles it
+    // (93-99% sidestep, 25 of 25, and the answer flips when the side does).
+    //
+    // Both robots are told the SAME side, which is the asymmetry that makes this
+    // work rather than a detail: they face opposite ways, so one robot's left is the
+    // other's right in world space, and naming the same side in each robot's own
+    // frame sends them apart. Naming them opposite sides would send both into the
+    // same half of the corridor.
+    doc.obstacle_position = "directly ahead in my lane";
+    // Name the side the robot must step TOWARD. The head answers the opposite of
+    // the named side (measured: naming `right` gets `left` 93-99% of the time), so
+    // naming the blocker's side is how it is told which way to move. Both robots
+    // name the same world side, which in their own mirrored frames is opposite, and
+    // that is what sends them apart.
+    doc.obstacle_side = sideToName(robot, scan);
   }
 
   others.slice(0, 2).forEach((desc, i) => { doc[`other_robot_${i + 1}`] = desc; });

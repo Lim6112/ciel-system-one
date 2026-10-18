@@ -201,23 +201,30 @@ async function askCJet(robot, scan, now) {
   const kind = scan.rack ? "rack" : "robot";
   const qid = S.questionId(kind, stalled);
   const question = S.buildQuestion(kind, stalled);
-  const state = S.buildState(robot, scan, now);
+
+  // ONE rule, ONE decision. The ontology's verdict is computed first and supplies
+  // all three things that depend on it: the option set, the head-on election, and —
+  // through the election — the rewrite of the observation below. Every earlier
+  // arrangement here had a second, independent derivation of one of those, and
+  // each one drifted: the option set and the gold disagreed once (a stand-off), the
+  // page and the simulator disagreed once (the page never passed the role at all),
+  // and the state text and the election would have disagreed here if the text were
+  // built before the election was known.
+  const verdict = permittedFor(robot, scan, stalled);
+  const feasible = verdict.options;
+  // The observation is built knowing which robot this is, because a dead-ahead
+  // meeting is rewritten so the one that concedes is told which way to step. See
+  // the rewrite in warehouse_sim.js `buildState`.
+  const state = S.buildState(robot, scan, now, verdict.role);
 
   document.getElementById("whoAsked").textContent =
     `Robot ${robot.id} (${robot.colorName}) asked ${qid} — blocked by ${kind}` +
     (stalled ? ` · stalled ${stalledFor.toFixed(1)} s, "wait" withdrawn` : "");
   document.getElementById("stateView").textContent =
     qid + "\n" + JSON.stringify(state, null, 2);
-
-  // The geometry answer, computed before asking: it is the oracle the eval
-  // scores against and the gate's fallback, so it must not read the model.
-  const oracle = S.goldDirection(scan, stalled);
-  // The permitted set comes from the ontology, not from the sim's own predicate.
-  // It is the same set — that equality is what test_warehouse_ontology.mjs checks
-  // over every blocking situation — but routing the demo through the declaration
-  // is what makes the panel an honest display of the rule in force rather than a
-  // readout of a rule kept somewhere else.
-  const feasible = permittedFor(robot, scan, stalled);
+  // The geometry answer, computed before asking: it is the oracle the eval scores
+  // against, and what the page shows next to the model's answer.
+  const oracle = S.goldDirection(scan, stalled, verdict.role);
   lastScene = { robot, scan, stalled };
 
   try {

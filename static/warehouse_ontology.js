@@ -366,6 +366,16 @@ export function reason(facts, { extensions = {} } = {}) {
     goldAction: robot && robot.goldAction.size ? [...robot.goldAction][0] : null,
     permitted: robot ? [...robot.permittedAction] : [],
     stalled: robot ? !!robot.stalled : false,
+    // Surfaced so a caller asking the question uses the SAME election the reasoner
+    // used, rather than recomputing it (or worse, not passing one at all). The page
+    // did the latter: it built the option set through here, where the role is
+    // applied, and then computed the displayed gold with no role — so the two halves
+    // of this one rule were derived independently in the same function call, which
+    // is exactly the arrangement that produced the head-on stand-off this election
+    // was added to fix. Both paths happened to agree at HEAD (an advancing robot
+    // stalls soon after, and the no-role branch then answers a sidestep too), which
+    // is why it was invisible: a latent bug, not an active one.
+    headOnRole: robot ? robot.headOnRole ?? null : null,
   };
 
   return { consistent: violations.length === 0, violations, unasserted, derived };
@@ -394,6 +404,9 @@ export function permittedActions(robot, scan, opts = {}) {
   const options = probe.derived.permitted;
   return {
     options: options.length ? options : ACTION_SET,
+    // Carried out so a caller can compute its own gold with the election this
+    // reasoner applied, instead of deriving the two halves of the rule separately.
+    headOnRole: probe.derived.headOnRole ?? null,
     ok: blocking.length === 0,
     violations: blocking,
     allViolations: probe.violations,

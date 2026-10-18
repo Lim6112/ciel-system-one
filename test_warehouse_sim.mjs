@@ -480,6 +480,76 @@ test("head-on resolutions stay under the stall budget", () => {
     `4 s stall budget — the election is not doing its job`);
 });
 
+test("a head-on state is rewritten so neither robot is told to wait", () => {
+  // The rewrite: dead ahead, the untransformed text says "ahead of me, but not
+  // blocking my lane", which the head reads as "not in my way" and answers `stay`
+  // — measured 25 of 25 on the live service. With a role, the text says the blocker
+  // IS in the lane and names a side, and the same 25 of 25 answer a sidestep at
+  // 93-99%. Pinned here because it is the whole reason no retraining was needed:
+  // the head already knew what in-lane-plus-a-side means.
+  const robots = createWorld(1);
+  const [a, b] = [robots[0], robots[1]];
+  a.x = 260; a.y = 330; a.heading = Math.PI; a.waypoints = [{ x: 100, y: 330 }]; a.wp = 0;
+  b.x = 220; b.y = 330; b.heading = 0; b.waypoints = [{ x: 400, y: 330 }]; b.wp = 0;
+  bindWorld(robots);
+  for (const [r, other] of [[a, b], [b, a]]) {
+    const scan = scanLidar(r, robots, CONFIG.lidarRange);
+    assert.ok(scan, "the two should see each other");
+    const role = headOnRole(r, scan);
+    assert.ok(role, "a dead-ahead pair must be elected");
+
+    const plain = buildState(r, scan, 0, null);
+    assert.equal(plain.obstacle_side, "center");
+    assert.equal(plain.obstacle_position, "ahead of me, but not blocking my lane",
+      "without a role the text still says the blocker is not in the lane — the phrasing " +
+      "that answers `stay`");
+
+    const rewritten = buildState(r, scan, 0, role);
+    assert.equal(rewritten.obstacle_position, "directly ahead in my lane",
+      "the rewrite must say the blocker IS in the lane");
+    assert.ok(["left", "right"].includes(rewritten.obstacle_side),
+      `the rewrite must name a side, got ${rewritten.obstacle_side}`);
+    assert.notEqual(rewritten.obstacle_side, "center");
+    // Off-centre cases must be left alone: they already carry a side and the
+    // ordinary gold reads it.
+    const offAxis = { ...scan, rel: { x: 40, y: scan.rel.y } };
+    assert.equal(buildState(r, offAxis, 0, role).obstacle_side, "right");
+  }
+});
+
+test("a head-on pair is sent to opposite sides of the corridor", () => {
+  // The sign that two earlier attempts got wrong. The head answers the OPPOSITE of
+  // the named side, so naming each robot the side it "has room on" sends both to
+  // the same half of the corridor. Because the two headings are opposed, naming the
+  // SAME side is what diverges — verified across every heading rather than argued.
+  const worldMove = (r, named) => {
+    const stepping = named === "left" ? "right" : "left";
+    const d = stepping === "left" ? -1 : 1;
+    const px = Math.cos(r.heading), py = Math.sin(r.heading);
+    return { dx: -py * d, dy: px * d };
+  };
+  for (let deg = 0; deg < 360; deg += 15) {
+    const h = deg * Math.PI / 180;
+    const a = { id: "R1", colorName: "red", x: 300, y: 300, heading: h, sidestepDir: 0,
+                waypoints: [], wp: 0, deliveries: 0, phase: "toDock" };
+    const b = { id: "R2", colorName: "green", x: 300 + Math.cos(h) * 20,
+                y: 300 + Math.sin(h) * 20, heading: (h + Math.PI) % (2 * Math.PI),
+                sidestepDir: 0, waypoints: [], wp: 0, deliveries: 0, phase: "toDock" };
+    bindWorld([a, b]);
+    const scanA = scanLidar(a, [a, b], CONFIG.lidarRange);
+    const scanB = scanLidar(b, [a, b], CONFIG.lidarRange);
+    if (!scanA || !scanB) continue;
+    const stA = buildState(a, scanA, 0, headOnRole(a, scanA) || "advance");
+    const stB = buildState(b, scanB, 0, headOnRole(b, scanB) || "advance");
+    const ma = worldMove(a, stA.obstacle_side), mb = worldMove(b, stB.obstacle_side);
+    const before = Math.hypot(b.x - a.x, b.y - a.y);
+    const after = Math.hypot((b.x + mb.dx) - (a.x + ma.dx), (b.y + mb.dy) - (a.y + ma.dy));
+    assert.ok(after > before + 1e-9,
+      `heading ${deg}deg: the pair converged (${before.toFixed(2)} -> ${after.toFixed(2)}) — ` +
+      `named "${stA.obstacle_side}"/"${stB.obstacle_side}"`);
+  }
+});
+
 test("createWorld is deterministic for a given seed", () => {
   const a = createWorld(42).map(r => [r.id, r.x, r.y, r.pickupRack.id]);
   const b = createWorld(42).map(r => [r.id, r.x, r.y, r.pickupRack.id]);
