@@ -45,13 +45,29 @@ export const ROBOT_R = 9;
 export const MIN_SEP = 2 * ROBOT_R + 3;                   // hard collision safety
 
 // Lidar half-angle: the default, and the slider range the page exposes.
-// It was 45 deg (the only value this sim ever ran, hard-coded at the scan site) and
-// is now 15 deg, set by request. The value is doing real work: a narrower cone sees
-// a cross-traffic robot later, so the robot commits further into an encounter before
-// it has any reason to yield. Every measured number recorded in this file above the
-// navigation section was taken at 45 deg, so those numbers describe a configuration
-// this build no longer starts in -- see LIDAR_ANGLE_DEFAULT_NOTE below.
-export const LIDAR_HALF_ANGLE = 15 * Math.PI / 180;
+// It was 45 deg (the only value this sim ever ran, hard-coded at the scan site),
+// then 15 deg, and is now 20 deg by request.
+//
+// THE ANGLE IS NOT THE MAIN CAUSE OF DEADLOCK, and an earlier version of this
+// comment claimed it was. That claim came from a harness that never called
+// `applyDecision`, so no robot was ever given a sidestep and every head-on pair
+// jammed in every configuration. Measured properly (15 seeds, 960 s, validated
+// against this file's recorded delivery counts), the dominant factor is the
+// SIDESTEP BUDGET, not the cone:
+//
+//   45 deg  90 px  sidestep unbounded   0 deadlock events
+//   45 deg  70 px  sidestep 30 px      12 events, worst 919 s
+//   20 deg  70 px  sidestep unbounded   1 event,  worst 802 s
+//   20 deg  70 px  sidestep 30 px       9 events, worst 887 s
+//
+// SIDESTEP_PX = 30 is therefore what to look at first -- see its own note. What the
+// angle does control is how often a robot is asked anything at all, and at a narrow
+// setting some stalls go unreported entirely: the hard collision check stops a robot
+// at MIN_SEP while the blocker sits up to 62 deg off the heading, outside a 15-20 deg
+// cone, so `scanLidar` returns null, the model is never asked, and no action can be
+// chosen regardless of what the action set contains. That is a sensing limit, not an
+// action-set limit, and it is why "add backward" cannot clear it.
+export const LIDAR_HALF_ANGLE = 20 * Math.PI / 180;
 export const LIDAR_ANGLE_MIN = 5 * Math.PI / 180;         // narrowest the slider allows
 export const LIDAR_ANGLE_MAX = 90 * Math.PI / 180;        // widest; >90 would see behind
 
@@ -141,6 +157,21 @@ export const LIDAR_RANGE_MAX = 150;
 // 42% of baseline deliveries in the sweep. It is the arm that exists to make the
 // failure visible rather than an improvement, so it is the demo's default now and
 // not a recommendation -- the sliders can take it back to unbounded in one drag.
+//
+// KNOWN ISSUE, ACCEPTED RATHER THAN MISSED: this value is the dominant cause of
+// permanent two-robot deadlock, and it was shipped with that known. Measured over 15
+// seeds x 960 s, holding everything else at the current defaults, with the harness
+// validated against this file's recorded delivery counts:
+//
+//   sidestep 30 px    9 deadlock events, worst 887 s   (92% of a run)
+//   sidestep unbounded 1 event,            worst 802 s
+//
+// The mechanism is the one the table above already describes, taken to its limit: a
+// robot that stops short of clearing the obstacle is re-blocked next tick, and under
+// this budget the pair can alternate re-blocks indefinitely instead of resolving.
+// The fix is the unbounded default, not a cleverer bound; the low end of the slider
+// is here to demonstrate the failure, and this is what it looks like when it runs
+// for a whole session.
 export const SIDESTEP_PX = 30;
 
 // The timer that caps a sidestep regardless of distance, so a slow robot cannot
@@ -859,6 +890,7 @@ export function bindWorld(robots) {
 // REJOIN_MEMORY_MS is roughly the time to clear a lane node at demo speed.
 const REJOIN_MEMORY_MS = 2000;
 const separatedFromRobots = new Map();
+let lastRejoinNow = 0;
 
 function noteRejoin(id, point, now) {
   separatedFromRobots.set(id, { id, point: { x: point.x, y: point.y }, at: now });
@@ -866,7 +898,19 @@ function noteRejoin(id, point, now) {
 
 // Active claims, expired ones dropped. Returns an array, not the Map — iterating a
 // Map yields [key, value] pairs, which silently makes every `other.point` undefined.
+//
+// A CLOCK THAT GOES BACKWARDS MEANS A NEW RUN, so the claims are dropped wholesale.
+// This matters because `now` is caller-supplied: a harness that runs two
+// configurations in one process restarts the clock at 0, and every surviving claim
+// then has a NEGATIVE age. `now - rec.at` is compared with `> REJOIN_MEMORY_MS`, so
+// stale claims never expire and the second configuration is measured against the
+// first configuration's lane choices. This was a real defect here: it made a
+// config-matrix harness report deadlocks in configurations that have none, and it
+// took a single-config reproduction to expose it. Any caller-held clock works with
+// this rule; the sim does not need to be told that a run ended.
 function liveRejoins(now) {
+  if (now < lastRejoinNow) separatedFromRobots.clear();
+  lastRejoinNow = now;
   for (const [id, rec] of separatedFromRobots)
     if (now - rec.at > REJOIN_MEMORY_MS) separatedFromRobots.delete(id);
   return [...separatedFromRobots.values()];

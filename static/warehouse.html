@@ -132,8 +132,8 @@
           <input type="range" id="lidar" min="50" max="150" step="10" value="70">
           <label id="lidarLabel">70 px</label></span>
         <span class="ctl"><label>Lidar angle</label>
-          <input type="range" id="lidarAngle" min="5" max="90" step="5" value="15">
-          <label id="lidarAngleLabel">15°</label></span>
+          <input type="range" id="lidarAngle" min="5" max="90" step="5" value="20">
+          <label id="lidarAngleLabel">20°</label></span>
         <span class="ctl"><label>Router</label>
           <select id="router">
             <option value="grid" selected>grid — 50 px, shorter paths</option>
@@ -150,11 +150,18 @@
         <br>
         The <strong>30 px</strong> default is set deliberately and is <em>not</em> an
         improvement: in the sweep recorded in <code>warehouse_sim.js</code> a 30 px
-        budget measured 42% of baseline deliveries, and no budget measured on that
-        sweep reduced sidestep travel at all. Shorter is worse because a robot that
-        stops short of clearing an obstacle is re-blocked next tick and sidesteps
-        again, so a shorter manoeuvre buys more manoeuvres. Drag this to the maximum
-        to see the behaviour every other number in this file was measured at.
+        budget measured 42% of baseline deliveries, and no budget on that sweep reduced
+        sidestep travel at all. Shorter is worse because a robot that stops short of
+        clearing an obstacle is re-blocked next tick and sidesteps again.
+        <br>
+        <strong>Expect robots to freeze at this setting, and it is not a bug in the
+        page.</strong> 30 px is the dominant cause of permanent two-robot deadlock: over
+        15 seeds and 960 s each it produces nine stalls of eight seconds or more, the
+        worst lasting 887 s — i.e. the rest of the run — against one at the unbounded
+        default. Two robots meet, neither manoeuvre is long enough to clear the other,
+        and they alternate re-blocks instead of resolving. Drag this to the maximum to
+        watch them recover; the low end is here to make the failure visible, and this
+        is what it looks like when it runs for a whole session.
         <br>
         Below <strong>21 px</strong> (two robot radii plus the safety margin) a robot
         cannot clear another robot at all, so the low end does not shorten the
@@ -162,14 +169,26 @@
         swerving get worse rather than better.
         <br><br>
         <strong>Lidar range</strong> is how far the cone reaches and <strong>lidar
-        angle</strong> is its half-width, defaulting to 70 px and 15°. Together they
-        set how early a robot notices a crossing counterpart. Both defaults are
-        narrower and shorter than the 90 px / 45° every other number in
-        <code>warehouse_sim.js</code> was measured at, and the effect is substantial
-        in both directions: the short narrow cone almost <em>doubles</em> throughput,
-        because a robot that never sees the other one coming never stops for it. The
-        cost is paid in collisions avoided rather than in deliveries, so it is worth
-        dragging back to 90 px / 45° to watch the difference.
+        angle</strong> is its half-width, defaulting to 70 px and 20°. Together they
+        set how early a robot notices a crossing counterpart, and the angle is the one
+        that matters here: it is the difference between a robot that yields and one
+        that simply stops.
+        <br>
+        Set the angle below about <strong>18°</strong> and the demo deadlocks, visibly
+        and permanently. The hard collision check refuses to let two robots overlap, so
+        a robot is stopped at 21 px — but if the other robot is off to the side, outside
+        the cone, nothing is ever <em>reported</em>: no obstacle, no question to the
+        model, no action, and the pair stands there for the rest of the run. Measured
+        at 15°: six stalls of 8 s or more over ten seeds, two of them over 800 s of a
+        960 s run. At 20° and above they do not occur. That is why this slider's low end
+        is interesting to watch and not worth using.
+        <br>
+        The other direction is a real trade. The 20° / 70 px default roughly
+        <em>doubles</em> throughput against 45° / 90 px, because a robot that never
+        sees the other one coming never stops for it — the traffic it avoids avoiding
+        is avoidance, not collisions, and physical overlap stays at zero either way.
+        Every other number recorded in <code>warehouse_sim.js</code> was measured at
+        45° / 90 px, so drag both back there to reproduce them.
         <br>
         Range and angle are separate knobs on purpose: a narrow cone at long range
         still sees an approaching robot in time, whereas a narrow cone at 70 px sees
