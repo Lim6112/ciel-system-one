@@ -98,6 +98,16 @@ export function permittedFor(robot, scan, stalled, deadlocked = false) {
     // gold from the same verdict rather than re-deriving the gate. The two drifting
     // apart is the failure mode this whole arrangement exists to prevent.
     deadlocked: verdict.deadlocked ?? false,
+    // AND THE WORDING. Leaving this out was a real bug, and it is worth naming why a
+    // one-line omission was not cosmetic: this function is a WRAPPER that hand-picks
+    // what the page may see, so a field the ontology grows is invisible to the page
+    // until it is listed here. The symptom was the deadlock sentence silently
+    // vanishing from the state -- the axiom still contributed it, and the page threw
+    // it away -- while the options still arrived, so the failure looked like "the
+    // model will not choose backward" rather than "the observation never said the
+    // robot was stuck". A pass-through wrapper is a place where a field can go
+    // missing without anything failing.
+    stateLeaf: verdict.stateLeaf ?? {},
     violations: verdict.violations,
   };
 }

@@ -458,15 +458,34 @@ function step(dt, now) {
   for (const robot of robots) {
     const scan = S.scanLidar(robot, robots, lidarRange());
     robot.obstacle = scan;
+    // A ROBOT THAT IS NOT MOVING IS BLOCKED, WHETHER OR NOT THE CONE SEES IT. This
+    // page used to zero `blockedSince` the moment the lidar came back empty, which
+    // is exactly the deadlock case: the hard collision check stops the robot at
+    // MIN_SEP while the blocker sits off to the side, outside a 15-20 deg cone. So
+    // the clock the escape is gated on was being reset in the one situation the
+    // escape exists for, `deadlocked` never became true, and `backward` was never
+    // offered -- with the options array looking correct in every unit test, because
+    // the tests pass the flag in rather than deriving it from a running page.
+    //
+    // The physics already knows the answer: `robot.deadlocked` is computed in
+    // `S.step` from no-progress and blocked clocks, and the wall-pinning fix in this
+    // same area is the other half of the lesson. So keep `blockedSince` while the
+    // robot is not making progress, and only clear it when it is genuinely free.
     if (scan) {
       if (robot.blockedSince === null) robot.blockedSince = now;
       // fallback (autoplay off): blocked robots just stop — the deadlock demo
       if (!document.getElementById("autoplay").checked) robot.waiting = true;
     } else {
-      robot.blockedSince = null;
-      robot.waiting = false;
+      // Keep the blocked clock alive for a robot that has stopped: it is wedged, not
+      // free. Cleared only once it is actually driving again.
+      const stalled = robot.lastProgressAt
+        && now - robot.lastProgressAt >= S.STALL_MS;
+      if (!stalled) {
+        robot.blockedSince = null;
+        robot.waiting = false;
+      }
     }
-    blocked.push(!!scan);
+    blocked.push(!!scan || !!robot.deadlocked);
   }
   document.getElementById("blockedNow").textContent = blocked.filter(Boolean).length;
   document.getElementById("deliveries").textContent =

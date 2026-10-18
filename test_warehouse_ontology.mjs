@@ -21,6 +21,7 @@ import {
   permittedActions,
   reason,
 } from "./static/warehouse_ontology.js";
+import { permittedFor } from "./static/warehouse_panel.js";
 import { createWorld, feasibleOptions, step } from "./static/warehouse_sim.js";
 
 const CONFIG = { speed: 80, lidarRange: 90, autoplay: true };
@@ -258,4 +259,24 @@ test("a non-deadlocked robot gets no deadlock wording", () => {
   const v = permittedActions(robot, null, { stalled: false, deadlocked: false });
   assert.deepEqual(v.stateLeaf, {});
   assert.ok(!v.options.includes("backward"));
+});
+
+test("the page's wrapper forwards every field the ontology grows", () => {
+  // `permittedFor` is a WRAPPER that hand-picks what the page may see, and that makes
+  // it a place where a new field goes missing without anything failing. It happened:
+  // `stateLeaf` was added to `permittedActions` and not listed here, so the deadlock
+  // sentence silently vanished from the observation while the options still arrived.
+  // The symptom read as "the model will not choose backward" rather than "the state
+  // never said the robot was stuck", which is why it survived the suite.
+  const robot = { id: "R1", x: 200, y: 200, heading: 0 };
+  const direct = permittedActions(robot, null, { stalled: true, deadlocked: true });
+  const wrapped = permittedFor(robot, null, true, true);
+  for (const field of ["options", "headOnRole", "deadlocked", "stateLeaf"]) {
+    const want = field === "headOnRole" ? direct.headOnRole : direct[field];
+    assert.deepEqual(wrapped[field === "headOnRole" ? "role" : field], want,
+      `permittedFor dropped or altered ${field}`);
+  }
+  // Specifically the deadlock sentence, since that is the one that went missing.
+  assert.ok(wrapped.stateLeaf && wrapped.stateLeaf.deadlock,
+    "the wrapper dropped the deadlock wording");
 });
