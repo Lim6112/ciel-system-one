@@ -132,10 +132,11 @@ robot's lidar sees its path blocked, it serializes the situation to **a flat JSO
 state** and asks laya a question about the blocker. The screen shows the canvas
 with lidar cones and route lines, per-robot lidar chips, "Laya's view" (the exact
 JSON the blocked robot sent) and "Laya's decisions" (action bars, confidence,
-latency, history, and a `decided · deferred` counter for the geometry gate). Hard
-collision prevention is independent of laya — physics never lets robots overlap;
-laya decides strategy. Toggle autoplay off to watch blocked robots stop forever:
-the deadlock laya prevents.
+latency, history, and — next to every decision — what the geometry says the answer
+should be and whether the model agreed). An **Ontology** panel shows the declared
+rule that decides which directions are offered. Hard collision prevention is
+independent of laya — physics never lets robots overlap; laya decides strategy.
+Toggle autoplay off to watch blocked robots stop forever: the deadlock laya prevents.
 
 **There are two blockers and they are two different problems**, so the demo asks
 two different questions. A **storage rack** is static and never yields — waiting
@@ -193,28 +194,50 @@ and are pinned by `test_warehouse_sim.mjs`:
   decisive leaf (`obstacle_side`, or `gap_left`/`gap_right` for a rack) standing
   alone instead of blended into a neighbour's text.
 
-#### The geometry gate, and the escalation trigger
+#### The geometry gate was removed, and what that costs
 
-Two safety layers sit outside the model, and neither pretends the model is in the
-loop when it is not:
+The demo used to run a confidence gate: below `CONF_FLOOR` (0.9) the geometry oracle
+decided instead of the model, and a `decided · deferred` counter showed how often
+that happened. It is gone. Two findings retired it, and the second is the reason it
+is recorded here rather than quietly deleted.
 
-- **The gate.** The geometrically feasible side set is computed before asking, and
-  an answer outside it is deferred to geometry *at any confidence* — a confident
-  impossible answer is still impossible. Below `CONF_FLOOR` the model is deferred
-  too, and the `decided · deferred` counter shows how often that happened.
+**Its safety half could not fire.** The gate also deferred any answer outside the
+feasible set, on the principle that a confident impossible answer is still
+impossible. But the model cannot produce one: `ciel.py` sends the criteria keys as
+the options and the service argmaxes over them, and `buildQuestion`'s criteria equal
+`feasibleOptions` — measured identical across **359,713 blocking cases**. So the
+model never has an out-of-menu answer to give. An unreachable safety check is not a
+safety check; it is a second home for a rule the ontology now owns, which is exactly
+the arrangement that produced today's standoff.
 
-  `CONF_FLOOR` is **0.9**, from the warehouse head's measured closed-loop p10 (0.995)
-  rather than from a guess — and it is a *single* constant serving a dropdown that
-  can select models an order of magnitude below it (the doc head's p50 is 0.57, the
-  laya arms ~0.03). That is deliberate: those models answer this domain at chance or
-  worse, so deferring them to geometry is the outcome the gate exists for. A floor
-  reused across models does not mis-set itself, it silently disables itself, which is
-  why the number is derived per model and the counter is on screen.
-- **Escalation is now a stall timer, not a blocked timer.** The old trigger (5 s
-  continuously blocked) could not fire: across the 178 recorded calls the longest
-  block was **3 s**, so the 2-way branch was unreachable and `stay` was always on
-  the menu. `STALL_MS` keys on *progress staleness* instead — no forward movement —
-  which is the condition the demo actually cares about and holds for rack blocks too.
+**Removing it costs what it used to hide.** The gate was compensating for models that
+cannot do this task, so without it those models are plainly wrong. Measured, same
+service, 50 scenarios each:
+
+| model | accuracy vs geometry | predicted | confidence p50 |
+| --- | --- | --- | --- |
+| `ciel_warehouse_v1` | **50/50 (100%)** | left 25 · right 25 | 0.998 |
+| `ciel_decision_model_v1` | 25/50 (50%) | **left 50** — collapsed | 0.568 |
+
+That is the honest reading: the demo now shows an incompetent model *being*
+incompetent instead of being silently rescued. On the `avoid_direction` question
+specifically the doc head agreed with geometry 13 times in 84 decisions — it answers
+`stay` to nearly everything, because most of its training golds are `stay`.
+
+Worth recording that progress is *not* by itself evidence of correctness. The doc
+head still produced 14 deliveries in a browser run — fewer than the working head, but
+not zero — and the first snapshot of that run happened to show `(agrees)`, which
+would have been a false confirmation if only a snapshot had been read. The per-model
+table above is the measurement; the live `geometry says … (agrees|differs)` readout
+next to every decision is there so the same mistake is visible rather than inferred.
+
+#### Escalation is a stall timer, not a blocked timer
+
+The old trigger (5 s continuously blocked) could not fire: across the 178 recorded
+calls the longest block was **3 s**, so the 2-way branch was unreachable and `stay`
+was always on the menu. `STALL_MS` keys on *progress staleness* instead — no forward
+movement — which is the condition the demo actually cares about and holds for rack
+blocks too.
 
 Re-derive the oracle numbers with `node eval_warehouse.mjs --model ciel_warehouse_v1`;
 that per-side accuracy and confusion table is the evidence for the head, and the
@@ -336,9 +359,9 @@ head-on → `stay` (1.000).
 
 **In the browser**, with `ciel_warehouse_v1` selected: decisions vary across all three
 actions at ~100% confidence, `blockedNow` repeatedly returns to 0, and deliveries
-accumulate — the partial gridlock the demo used to stall in is gone. The gate defers
-nothing on this head (324 decided · 0 deferred over a run), which is the expected
-result of a floor below the head's p10.
+accumulate — the partial gridlock the demo used to stall in is gone. Every decision's
+`geometry says … (agrees|differs)` readout reads `agrees`, which is now a measurement
+rather than a claim about a gate that might have covered for the model.
 
 **One limitation to know when reading the oracle.** The harness drives the sim, and
 it does not feed answers back into it — so the scenarios it samples are the ones the

@@ -37,7 +37,6 @@
     background: var(--accent-soft); color: var(--accent); font-weight: 600;
     font-size: 12px; visibility: hidden; }
   .badge.on { visibility: visible; }
-  .gate-meta { font-size: 12px; }
   .chips { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
   .chip { padding: 3px 10px; border-radius: 999px; font-size: 12px;
     border: 1px solid var(--border); color: var(--muted); background: #fff; }
@@ -97,7 +96,6 @@
       <div class="hud">
         <span>Deliveries <strong id="deliveries">0</strong></span>
         <span>Blocked now <strong id="blockedNow">0</strong></span>
-        <span id="gateCount" class="gate-meta">0 decided · 0 deferred</span>
         <span class="badge" id="autoplayBadge">CJET IS DISPATCHING</span>
       </div>
       <canvas id="sim" width="520" height="420"></canvas>
@@ -114,8 +112,6 @@
         <button id="pauseBtn">Pause</button>
         <span class="ctl"><input type="checkbox" id="autoplay" checked>
           <label for="autoplay">CJet dispatch <span style="color:var(--muted)">(off = blocked robots stop forever)</span></label></span>
-        <span class="ctl"><input type="checkbox" id="gate" checked>
-          <label for="gate">Geometry gate <span style="color:var(--muted)">(off = model decides alone)</span></label></span>
         <span class="ctl"><label>Model</label>
           <select id="model">
             <option value="auto">auto</option>
@@ -177,20 +173,6 @@ import { mountWarehousePanel, permittedFor } from "./warehouse_panel.js";
 const W = S.W, H = S.H;
 let robots = [], running = false, paused = false;
 let lastTime = 0;
-let decided = 0, deferred = 0;
-
-// The confidence floor below which the deterministic geometry answer decides.
-//
-// Measured per model, never guessed, and never shared between models. The
-// warehouse head's confidence is saturated near 1 (closed-loop: p10 0.995,
-// p50 0.998), so any floor below ~0.99 is inert — which is fine, because a floor
-// is cheap insurance against a *different* model being swapped in, not something
-// this head needs. Two models this demo can select are far below it: the doc head
-// reports p50 0.57 and the laya arms ~0.03, and both answer this domain at chance
-// or worse, so they defer to geometry on nearly every decision. That is the
-// intended behaviour — a gate reused across models does not mis-set itself, it
-// silently disables itself, so the number is per-model and the counter is visible.
-let CONF_FLOOR = 0.9;
 
 // The most recent blocking scene, for the ontology panel's ABox row. Replaced each
 // time a robot asks; the panel reads whatever is current.
@@ -201,7 +183,6 @@ const ctx = canvas.getContext("2d");
 
 function speed() { return Number(document.getElementById("speed").value); }
 function lidarRange() { return Number(document.getElementById("lidar").value); }
-function gateOn() { return document.getElementById("gate").checked; }
 
 // ---- CJet decision loop ------------------------------------------------------
 
@@ -260,22 +241,16 @@ async function askCJet(robot, scan, now) {
 
 function applyDecision(robot, scan, body, meta, now) {
   const answer = body.result.answers[meta.qid];
-  const modelAction = answer.choice;
+  // The model can only answer from the option set it was sent — `ciel.py` passes
+  // the criteria keys as the options and the service argmaxes over them — so the
+  // action is legal by construction and there is nothing to second-guess. The set
+  // itself is owned by the ontology, which is what makes it legal.
+  const action = answer.choice;
   const confidence = answer.confidence || 0;
-
-  // Gate: the geometry answer decides when the model is neither confident nor
-  // even choosing something the geometry left on the menu. An infeasible pick
-  // is deferred regardless of confidence — a confident impossible answer is
-  // still impossible.
-  const infeasible = !meta.feasible.includes(modelAction);
-  const gated = gateOn() && (infeasible || confidence < CONF_FLOOR);
-  const action = gated ? meta.oracle : modelAction;
-  if (gated) deferred++; else decided++;
-  updateGateCounter();
 
   S.applyDecision(robot, action, now);
   renderDecision(robot, action, answer.probabilities || {}, confidence,
-                 body.latency_ms, scan, meta, gated);
+                 body.latency_ms, scan, meta);
 }
 
 // bar order follows whichever question was asked (2- or 3-way)
@@ -284,7 +259,7 @@ function barsFor(probs) {
   return known.filter(label => label in probs);
 }
 
-function renderDecision(robot, action, probs, confidence, latency, scan, meta, gated) {
+function renderDecision(robot, action, probs, confidence, latency, scan, meta) {
   const bars = document.getElementById("decisionBars");
   bars.innerHTML = "";
   for (const label of barsFor(probs)) {
@@ -298,23 +273,22 @@ function renderDecision(robot, action, probs, confidence, latency, scan, meta, g
       `<div class="bar-label">${pct}%${label === action ? " ← CJet" : ""}</div>`;
     bars.appendChild(row);
   }
+  // The geometry answer is shown next to the model's so a disagreement is visible
+  // — which is how the head's repair was confirmed (the old head disagreed on
+  // every rack) and how a regression would show up. It is a readout, not a gate.
   document.getElementById("decisionMeta").textContent =
     `robot ${robot.id} · ${meta.qid} · confidence ${confidence} · latency ${latency} ms` +
-    ` · geometry says ${meta.oracle}` + (gated ? " · GATED to geometry" : "");
+    ` · geometry says ${meta.oracle}` +
+    (meta.oracle === action ? " (agrees)" : " (differs)");
 
   const history = document.getElementById("history");
   const entry = document.createElement("div");
   entry.innerHTML =
     `<span class="act act-${action}">${robot.id} → ${action.replace("_", " ")}</span>` +
     ` (${((probs[action] || 0) * 100).toFixed(0)}%) · gap ${S.fmtM(scan.dist)} · ` +
-    `${gated ? "gated · " : ""}${new Date().toLocaleTimeString()}`;
+    `${new Date().toLocaleTimeString()}`;
   history.prepend(entry);
   while (history.children.length > 12) history.lastChild.remove();
-}
-
-function updateGateCounter() {
-  document.getElementById("gateCount").textContent =
-    `${decided} decided · ${deferred} deferred`;
 }
 
 function showError(message) {
@@ -494,7 +468,6 @@ function startSim() {
   // A fresh world each run; the module seeds its own RNG from this.
   robots = S.createWorld(Math.floor(Math.random() * 1e9));
   running = true; paused = false;
-  decided = 0; deferred = 0;
   document.getElementById("pauseBtn").textContent = "Pause";
   document.getElementById("history").innerHTML = "";
   document.getElementById("decisionBars").innerHTML = "";
@@ -552,9 +525,11 @@ window.__simState = () => robots.map(r => ({
   waiting: r.waiting, sidestep: performance.now() < r.sidestepUntil,
   headingDeg: Math.round(r.heading * 180 / Math.PI), deliveries: r.deliveries,
 }));
-// console override for the floor, so a measured percentile can be tried without
-// editing the page — see the CONF_FLOOR comment for where the number comes from
-window.__setConfFloor = v => { CONF_FLOOR = Number(v) || 0; };
+// The confidence floor that used to override the model is gone: the option set is
+// owned by the ontology, so an action the model returns is legal by construction,
+// and second-guessing it with a geometry oracle was a second home for the same
+// rule. The oracle is still computed and displayed next to the model's answer, as
+// a readout rather than a gate.
 
 requestAnimationFrame(frame);
 </script>
