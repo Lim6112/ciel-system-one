@@ -169,7 +169,7 @@ export const TBOX = [
     // What DOES decide it is the sub-path, and -- more sharply -- whether
     // `obstacle_side` is present. Both are recorded on this axiom because a `left`
     // here is otherwise very hard to attribute.
-    stateLeaf: { deadlock: "wedged, no progress for 8s" },
+    stateLeaf: { deadlock: "wedged, no progress for 8s, should move backward " },
     comment:
       "Tier 1. A deadlocked robot -- stuck AND blocked for DEADLOCK_MS (8 s) -- is " +
       "permitted to reverse, which no other state permits. This is the only axiom here " +
