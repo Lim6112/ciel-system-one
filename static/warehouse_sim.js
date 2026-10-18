@@ -44,7 +44,91 @@ export const PX_PER_M = 10;
 export const ROBOT_R = 9;
 export const MIN_SEP = 2 * ROBOT_R + 3;                   // hard collision safety
 export const LIDAR_HALF_ANGLE = 45 * Math.PI / 180;
+// 1500 ms, i.e. ~119 px at demo speed, and MEASURED AS SPENT IN FULL: every
+// completed sidestep ran 1488 ms and travelled 119 px, to the millisecond and the
+// pixel. Two robots are 18 px across and need to clear each other by MIN_SEP (21 px),
+// so the manoeuvre spends roughly six times what the obstacle requires, and at ~8.5
+// sidesteps per delivery (972 px of swerve against 982 px of actual route progress)
+// nearly all of the swerving is surplus.
+//
+// THREE ATTEMPTS TO SPEND LESS, ALL REVERTED. Recorded because each looked obviously
+// right and each measured worse, and the reasons are not guessable:
+//
+//   - stop when the forward cone clears. A robot steps just far enough to lose sight
+//     of the obstacle and stops — still standing in the other robot's lane, so it is
+//     re-blocked next tick. Encounters went 9,000 -> 70,560.
+//   - stop when `|rel.x| >= MIN_SEP` against `robot.obstacle`. The reference is
+//     re-read every tick, so in a three-robot pileup it keeps changing, `|rel.x|`
+//     never accumulates, and the advancer sidesteps forever while the other two
+//     yield: three robots at 300+ s of no progress, deliveries 226 -> 160.
+//   - the same test against a referent frozen when the manoeuvre starts. A rack
+//     appearing mid-sidestep reads as "different blocker", ends the manoeuvre on the
+//     tick it begins, and it restarts: deliveries 226 -> 73, 205,000 ticks blocked
+//     on racks.
+//
+// The common failure is that "is the obstacle clear" is a question about a scene
+// that keeps changing while the robot acts on it, and every cheap answer to it has
+// been unstable. Racks make it worse: a rack hit is a straight-ray distance with no
+// lateral offset, so the one signal the robot-blocks use does not exist for them.
+// What would work is deciding the exit distance ONCE, at decision time, from the
+// blocker then in front, and holding it for the manoeuvre — not re-deriving it.
+//
+// A FOURTH ATTEMPT ALSO FAILED, and it was the one that looked arithmetic-proof:
+// just shorten the timer. 1500 ms gives ~119 px, six times the MIN_SEP (21 px) a
+// robot needs, so 600 ms looked like a free 2.5x saving with the bound worked out
+// as "24 px at the slowest slider speed, still over MIN_SEP".
+//
+// Deliveries went 226 -> 17 and 222,767 ticks went to robots standing blocked.
+// The arithmetic was about the wrong distance: MIN_SEP is how far apart two robots
+// must stay, not how far one must travel to stop being in the way. Clearing a rack
+// means leaving the aisle the rack bounds, and clearing a robot that is also moving
+// means out-running its approach — neither is 24 px. 1500 ms is not obviously wrong
+// for what it is doing; it was the justification for shortening it that was.
+//
+// A FIFTH ATTEMPT SWEPT THE BUDGET DIRECTLY, and the result says the target is wrong
+// rather than the method. A distance budget decided once at decision time (the shape
+// the four earlier failures pointed at) was swept over seven seeds:
+//
+//   budget     sidestep/배송 vs baseline    배송 vs baseline
+//   infinite             100%                    100%
+//       80px             104%                    111%
+//       60px             128%                     59%
+//       45px             226%                     11%
+//       30px              91%                     42%
+//
+// No budget reduces sidestep travel, and shorter is WORSE, not better. The reason is
+// the one that defeats every attempt at this: a robot that stops short of clearing
+// the obstacle is re-blocked on the next tick and sidesteps AGAIN, so a shorter
+// manoeuvre buys more manoeuvres. Distance travelled per delivery rises while
+// nobody clears anything. 1500 ms is not waste to be trimmed; it is what it takes
+// for one sidestep to be enough.
+//
+// So the swerving is not a tunable surplus. If it is to come down, the route has to
+// stop putting robots head-on in the first place — which is a planning change, not a
+// manoeuvre change. Five attempts to fix it in the manoeuvre are recorded above.
+// How far a sidestep may travel, in pixels — the knob the demo exposes.
+//
+// A DEFAULT, not a law. The manoeuvre used to be bounded by SIDESTEP_MS alone, which
+// at demo speed is ~119 px; the slider lets that be traded against throughput live,
+// because the honest position is that this file does not know the right value. Six
+// attempts to derive one are recorded below and every one measured worse.
+//
+// `null` means "unbounded": travel until the timer runs out, which is the long-
+// standing behaviour and the only arm that has survived measurement. Any number here
+// bounds the distance instead; see `sidestepBudgetSpent` for why the bound is a
+// number fixed at decision time rather than a live "is it clear" test.
+export const SIDESTEP_PX = null;
+
+// The timer that caps a sidestep regardless of distance, so a slow robot cannot
+// crawl indefinitely. Was the only bound until SIDESTEP_PX was added.
 export const SIDESTEP_MS = 1500;
+
+export function sidestepBudgetSpent(robot, budgetPx) {
+  if (budgetPx == null) return false;
+  const dx = robot.x - robot.sidestepFromX;
+  const dy = robot.y - robot.sidestepFromY;
+  return Math.hypot(dx, dy) >= budgetPx;
+}
 
 // Escalation: how long a robot may make NO forward progress before it stops
 // asking "how do I resolve this" and starts being told to go around.
@@ -140,11 +224,17 @@ export function makeRobot(rid, rng = Math.random) {
     phase: "toPickup", pickupRack: null,   // toPickup -> toDock -> loop
     heading: 0, waiting: false,
     sidestepUntil: 0, sidestepDir: 0,
+    // Where this sidestep started, so its distance can be bounded. See
+    // `sidestepBudgetSpent` and SIDESTEP_PX.
+    sidestepFromX: 0, sidestepFromY: 0,
     // stall tracking: blockedSince is the raw obstacle timer (kept for the
     // readout), lastProgressAt is what actually drives escalation
     blockedSince: null, lastProgressAt: 0, lastProgressX: spec.start.x,
     lastProgressY: spec.start.y,
     obstacle: null, deliveries: 0, asking: false, lastAsk: 0,
+    // The seeded rng, kept so every later task assignment draws from the same
+    // deterministic stream rather than falling back to Math.random.
+    rng,
   };
   assignTask(robot, rng);
   return robot;
@@ -285,7 +375,49 @@ function bandGap(px) {
   return px > 45 ? "wide" : "narrow";
 }
 
-export function buildState(robot, scan, now = 0) {
+// Which side to NAME in the head-on rewrite, such that the two robots step to
+// opposite sides of the corridor.
+//
+// This is easy to get backwards, and both earlier attempts did. The model answers
+// the OPPOSITE of the named side (measured: name `right`, get `left` 93-99%), so
+// "name the side they should step toward" is wrong by one negation — and naming the
+// same side for both robots, which looked like the obvious way to make mirrored
+// headings diverge, makes them step the same way instead. Verified by construction
+// below rather than by argument.
+//
+// So it is computed by doing it: take this robot's step direction for each of the
+// two names, and name whichever one moves it away from the counterpart's position.
+// That is a fact about the two robots' actual world coordinates, needs no shared
+// state, and cannot disagree with itself — each robot asks only "which way is
+// farther from the thing in front of me".
+// A CONSTANT, and that is the counterintuitive part.
+//
+// Two robots meeting head-on have opposite headings, so for a robot at heading h and
+// its counterpart at h+pi, the same named side produces OPPOSITE world movement:
+// with movement = (-sin(h)*d, cos(h)*d) and the same `d` on both sides, flipping h
+// flips the sign of every component. So naming the SAME side is what sends them
+// apart, and naming "the side each one has room on" — which is what this function
+// tried first, twice — sends them to the same half of the corridor.
+//
+// The first attempt read `robot.sidestepDir` for "which way is this robot already
+// stepping". That field starts at 0 and is only written by a decision, so both
+// robots reported "left" before asking and then kept their own committed direction
+// afterwards: same answer by accident, then divergent answers by drift.
+//
+// The second attempt named whichever side moved the robot away from the
+// counterpart, projected onto the robot-to-other vector. That is exactly zero for
+// both candidates in a head-on meeting — the step is perpendicular to the approach —
+// so the tie-break named both robots the same side, and by the rule above the same
+// side diverges... except the model answers the opposite of the named side, so an
+// extra negation flips it back to converging. Two sign errors that cancel are still
+// two sign errors; the comment at the call site records the arithmetic instead.
+const HEAD_ON_NAME = "right";
+
+function sideToName(robot, scan) {
+  return HEAD_ON_NAME;
+}
+
+export function buildState(robot, scan, now = 0, role = null) {
   const others = robot.others
     ? robot.others.filter(o => o !== robot.id)
         .map(id => describeOther(robot, id))
@@ -329,6 +461,49 @@ export function buildState(robot, scan, now = 0) {
     doc.obstacle_motion = scan.motion || "moving in the same direction";
   }
 
+  // The ontology's rewrite of the observation, in the same spirit as breakout's
+  // reachability regime: when the declaration says an action is not permitted, the
+  // text the model is asked about says so too, rather than the model being asked a
+  // question whose answer is then overridden.
+  //
+  // WHAT THIS IS FOR. Dead ahead, the untransformed text reads "ahead of me, but
+  // not blocking my lane", which the head reads correctly as "not in my way" and
+  // answers `stay` — exactly what it was trained to answer for that phrasing. So
+  // both robots yield and the pair sits out STALL_MS. Measured on the live service,
+  // 25 of 25 head-on states answered `stay`, and rewriting these two fields moved
+  // 25 of 25 to a sidestep at 93-99% confidence, with the side tracking the field:
+  // `obstacle_side: right` -> `left`, `obstacle_side: left` -> `right`.
+  //
+  // NO RETRAINING NEEDED, and that is the whole point of doing it here instead of
+  // in the corpus. The head already knows `obstacle_position` in-lane plus a side
+  // means "step the other way"; the state simply was not saying it. Changing the
+  // corpus would have required a retrain AND would have changed what `stay` means
+  // for the states where waiting is the right answer.
+  //
+  // The side comes from geometry, not from the model: whoever is not elected to go
+  // first steps aside, and which side is theirs is read off their heading. Letting
+  // the model choose it would be the gate this demo removed.
+  if (doc.obstacle_kind === "robot" && doc.obstacle_side === "center" && role) {
+    // Both roles are told a side, because "in my lane" plus "center" is not enough:
+    // measured on the live service, that combination still answers `stay` for one
+    // robot in four (l=33% s=47%), which is the same stall this rewrite exists to
+    // remove — it had only moved to the other robot. Naming a side settles it
+    // (93-99% sidestep, 25 of 25, and the answer flips when the side does).
+    //
+    // Both robots are told the SAME side, which is the asymmetry that makes this
+    // work rather than a detail: they face opposite ways, so one robot's left is the
+    // other's right in world space, and naming the same side in each robot's own
+    // frame sends them apart. Naming them opposite sides would send both into the
+    // same half of the corridor.
+    doc.obstacle_position = "directly ahead in my lane";
+    // Name the side the robot must step TOWARD. The head answers the opposite of
+    // the named side (measured: naming `right` gets `left` 93-99% of the time), so
+    // naming the blocker's side is how it is told which way to move. Both robots
+    // name the same world side, which in their own mirrored frames is opposite, and
+    // that is what sends them apart.
+    doc.obstacle_side = sideToName(robot, scan);
+  }
+
   others.slice(0, 2).forEach((desc, i) => { doc[`other_robot_${i + 1}`] = desc; });
   doc.deliveries_completed = robot.deliveries;
   doc.blocked = stalledFor >= STALL_MS / 1000 ? "for a while" : "briefly";
@@ -354,7 +529,186 @@ export function bindWorld(robots) {
   robotsById = new Map(robots.map(r => [r.id, r]));
 }
 
-// ---- physics ----------------------------------------------------------------
+// ---- head-on priority -------------------------------------------------------
+//
+// Two robots meeting dead ahead cannot be told apart by geometry: their lateral
+// offset is zero, so there is no side to prefer, and the gold oracle answers
+// "stay" to BOTH of them. Both yield, nobody moves, and the pair sits there until
+// STALL_MS (4 s) expires and escalation forces a sidestep — which is why head-on
+// encounters resolved in ~4.4 s while every other block resolved in ~0.22 s
+// (measured: 96% of the >4s episodes were head-on, and 96% of those had
+// escalated).
+//
+// So the dead band needs a tie-break, and the rule is: the LOWER ID advances, the
+// other yields. That is asymmetric by construction — exactly one robot can hold the
+// lower id — which is what makes the deadlock structurally impossible rather than
+// merely unlikely. Same principle as the dock rule, where the incumbent is found
+// rather than elected.
+//
+// WHY THIS NEEDS A LEADER, AND HOW THE LEADER IS PICKED. The comparison must reach
+// the same verdict on both robots independently, and two candidates were measured:
+//
+//   first-detected (blockedSince) — the tick each robot first saw an obstacle.
+//     Wall-clock, equal on both sides, no coordinate frame involved. Measured as
+//     the worse rule: p90 1,376 ms, max 5,920 ms, and 704 encounters over 4 s.
+//   lower id — needs no memory at all. p90 672 ms, max 3,088 ms, and ZERO
+//     encounters over 4 s. Reproducible across runs once `assignTask` stopped
+//     drawing from Math.random (see that call site — before the fix every A/B
+//     here was noise).
+//
+// The id rule wins because `blockedSince` is not a stable property of the
+// MEETING, it is a property of each robot's own history: a robot that has been
+// blocked by something else, or blocked longer ago, carries a stale value into a
+// new encounter and elects the wrong side. Measured: the role flipped mid-encounter
+// in ~6% of encounters, and flipping is what re-arms the STALL_MS wait. The id
+// comparison reads only who the counterpart is, so it cannot be stale and cannot
+// disagree between the two robots — each compares its own id against the other's
+// and exactly one concludes "advance".
+//
+// The cost, stated plainly: the lower id is always the one that goes first, so the
+// rule is unfair in a way a wall-clock race is not. It buys a 2x p90 and removes
+// the >4 s tail entirely, which is the trade this demo wants — but it is a trade,
+// not a free lunch, and if fairness ever matters more than latency the
+// `blockedSince` version is the one to bring back.
+//
+// WHAT THIS RULE STILL GETS WRONG, kept here because the attempt to fix it was
+// reverted and the diagnosis is the expensive part. Watching the live page, the
+// yielding robot WAITS FOR A ROBOT THAT IS NOT COMING: it holds at a fixed spot
+// with "stay" while the robot elected to advance has already passed, or is dodging
+// and returning to its own route without ever clearing the path. Escalation breaks
+// it at the STALL_MS price every time, which is why robot-vs-robot blocks in the
+// browser measure p90 ~4.7 s with 6 of 39 over 4 s, while rack blocks (which never
+// yield) are 0 of 51. Measured in the page, not in a harness.
+//
+// Three fixes were tried and all were reverted, with the numbers:
+//   - both robots dodge, nobody yields. Better in the harness, worse in the page:
+//     agreement with the model fell to 40%, because the trained head learned `stay`
+//     for a head-on blocker and this stops producing it. A gold change needs a
+//     retrain, not a code change.
+//   - end the sidestep early once the lane clears (`|rel.x| >= MIN_SEP`). Helped,
+//     but a rack hit carries no `rel`, so "no rel" read as "clear" and every rack
+//     sidestep restarted each tick — 70,560 encounters where there had been 9,000.
+//   - re-plan from the post-sidestep position (`replanFrom`). Made it worse:
+//     routeToRack/routeToDock build their L-chain from the current position and
+//     reset `wp = 0`, so the first leg is often backwards — 3,585 deliveries became
+//     2,759, sidestep travel per delivery 475 px became 662 px.
+// The one change that DID measure as a clear win and was also reverted with the
+// rest: `warehouse.html` passing `role` into `goldDirection`. Without it the page
+// silently used the unresolved branch while the simulator and every harness run had
+// moved on — see the note at that call site.
+//
+// `role` is "advance" for the lower id, "yield" for the other. Returns null for
+// anything that is not a dead-ahead encounter, so callers can fall through to the
+// ordinary gold.
+export const HEAD_ON_BAND_PX = 12;      // same dead band goldDirection uses
+
+// THE REMAINING TAIL, DIAGNOSED BUT NOT FIXED. About 5 encounters in 11,204
+// (0.04%) still exceed 4 s, and they have one shape. The two robots do not agree
+// on whether they are head-on: the higher id sees the other dead ahead and yields,
+// while the lower id sees it at an angle (|rel.x| > the dead band), gets role null,
+// and dodges and returns to its route over and over. So the yielder waits for a
+// robot that IS moving but is not clearing its path, and only STALL_MS breaks it
+// (measured: yielder stall 1.3 s climbing to 7.7 s while the counterpart's stall
+// stayed at 0.0 s throughout).
+//
+// A counterpart-stall rule was tried and removed: it asks "is the robot I am
+// waiting for moving", and that robot moves busily while never clearing, so the
+// rule fired almost never (6 encounters over 4 s became 5). The signal that would
+// work is "has the distance between us stopped closing" — progress of the
+// ENCOUNTER rather than of either robot — which needs per-encounter state the sim
+// does not keep. Not attempted here: it is more machinery than the 0.04% justifies,
+// and this file's history is a list of plausible rules that measured worse.
+export function headOnRole(robot, scan) {
+  if (!scan || scan.rack || !scan.rel) return null;
+  if (Math.abs(scan.rel.x) > HEAD_ON_BAND_PX) return null;
+  if (scan.rel.y <= 0) return null;              // not actually ahead of me
+  // No counterpart to compare against (a harness driving a single robot): the
+  // robot in front of us advances, because nothing has elected it to yield.
+  if (!robotsById.has(scan.other)) return "yield";
+  return robot.id < scan.other ? "advance" : "yield";
+}
+
+// Rejoin the route after a sidestep, by PROJECTING onto the path already planned
+// rather than re-deriving one.
+//
+// WHY NOT JUST CALL THE ROUTER AGAIN. `routeToRack`/`routeToDock` build their
+// L-chain from the robot's current position and reset `wp = 0`, and their first leg
+// is always "go to `nearestCorridor(robot.y)`". A robot that has just stepped
+// sideways off its corridor is already AT that corridor, so that first leg is pure
+// sideways backtracking back onto the line it deliberately left — and because it
+// resets `wp`, the robot also re-walks legs it had already completed. Measured:
+// 3,585 deliveries became 2,759 and sidestep travel per delivery went 475 px to
+// 662 px. The router is right for planning from rest and wrong for rejoining.
+//
+// What re-joining needs is the part of the OLD chain the robot has not yet passed.
+// The old chain is a sequence of axis-aligned segments along corridors and aisles,
+// so "where has the robot got to" is answerable without the router: find the
+// segment nearest the robot's current position and keep everything from its far end
+// onward, then head for the near end of that segment first to get back onto the
+// line. The goal is unchanged, so nothing is re-decided — only the rejoining leg.
+//
+// `from` is a robot-like object with x/y; returning the input unchanged means the
+// re-plan found nothing better, and the caller keeps its existing path.
+export function rejoinPath(robot) {
+  const pts = robot.waypoints;
+  if (!pts || pts.length === 0) return false;
+  const here = { x: robot.x, y: robot.y };
+
+  // Everything already behind the robot is finished; `wp` is the index of the
+  // segment it is currently travelling, so start there.
+  let best = -1, bestDist = Infinity;
+  for (let i = Math.max(0, robot.wp - 1); i < pts.length; i++) {
+    const p = pts[i];
+    // Distance to the segment p -> pts[i+1] (or to p itself for the last point).
+    const q = pts[i + 1] || p;
+    const dx = q.x - p.x, dy = q.y - p.y;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 === 0 ? 0 : Math.max(0, Math.min(1,
+      ((here.x - p.x) * dx + (here.y - p.y) * dy) / len2));
+    const cx = p.x + dx * t, cy = p.y + dy * t;
+    const d = Math.hypot(here.x - cx, here.y - cy);
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  if (best < 0) return false;
+
+  // Rejoin at the near end of the segment the robot is on, then keep the rest of
+  // the chain exactly as planned. Naming the NEAR end is what pulls the robot back
+  // onto its line with the shortest correction; keeping the tail means nothing
+  // ahead of it is re-decided, so the goal and the route beyond the swerve are
+  // untouched.
+  //
+  // The rejoining point is dropped if the robot is already essentially on it, which
+  // is the common case (a sidestep of a few pixels clears the lane): then the
+  // planned path is simply resumed and no correction leg exists at all.
+  // The index comes from the scan above, NOT from searching for the point. Using
+  // `pts.indexOf(rejoin)` was a real bug that made the path grow without bound: the
+  // segments of an axis-aligned chain share their endpoints by reference, so
+  // `indexOf` resolved to an earlier index than the segment just chosen and `slice`
+  // never removed anything — every rejoin prepended one more copy of the same point.
+  // Observed live: 122 identical waypoints in front of a robot whose `wp` stayed 0,
+  // oscillating between two x positions and reaching neither. Fixing it took the
+  // harness from 198 to 359 deliveries, which is the largest single improvement of
+  // any change in this file.
+  const p = pts[best];
+  const q = pts[best + 1];
+  const dToP = Math.hypot(here.x - p.x, here.y - p.y);
+  const dToQ = q ? Math.hypot(here.x - q.x, here.y - q.y) : Infinity;
+  const useQ = dToQ <= dToP;
+  const rejoin = useQ ? q : p;
+  const keepIdx = useQ ? best + 1 : best;
+  const alreadyThere = Math.hypot(here.x - rejoin.x, here.y - rejoin.y) < 2;
+  const tail = pts.slice(keepIdx + (alreadyThere ? 1 : 0));
+  const next = alreadyThere ? tail : [rejoin, ...tail];
+  // Never leave the robot with no waypoints. An empty path is read as "arrived" by
+  // the step loop, which would fire a phase change from a swerve rather than from
+  // reaching the goal — so a re-plan that empties the path is refused and the
+  // caller keeps what it had.
+  if (next.length === 0) return false;
+  robot.waypoints = next;
+  robot.wp = 0;
+  return true;
+}
+
 
 // circle vs rack rect: clamp the circle center to the rect, then distance test
 export function hitsRack(x, y) {
@@ -368,34 +722,57 @@ export function hitsRack(x, y) {
 // Which way actually clears a blocker, from geometry alone. This is the oracle
 // eval_warehouse.mjs scores the model against, and the gate's fallback — so it
 // must not read any surface word.
-export function goldDirection(scan, stalled = false) {
+export function goldDirection(scan, stalled = false, role = null) {
   if (scan.rack) {
     // Away from where the rack sits — which is also the wider-gap side.
     const lateral = scan.rackLateral ?? 0;
     return lateral > 0 ? "left" : "right";
   }
   const rel = scan.rel || { x: 0 };
-  // Head-on. `stalled` decides which of the two head-on answers applies, and
-  // the flag is not optional trivia: without it this returns "stay", which
-  // `feasibleOptions` has just withdrawn because waiting demonstrably failed. A
-  // gate that defers to this answer would put the robot straight back into the
-  // wait it escalated out of, forever — measured at 791 deferred against 40
-  // decided, with robots pinned in a head-on standoff.
-  if (Math.abs(rel.x) <= 12) {
-    // Head-on and stalled: there is no preferred side to read off the offset
-    // (it is ~zero), so the answer is a fixed "left". A fixed choice is what
-    // makes it a symmetry break rather than a coin flip: two robots facing each
-    // other have opposite headings, so each one's "left" is the other's right in
-    // world space — they move apart instead of mirroring into another standoff.
+  if (Math.abs(rel.x) <= HEAD_ON_BAND_PX) {
+    // Dead ahead, so the offset carries no side to prefer. Two cases, and they
+    // differ by whether anything has been elected:
+    //
+    // `role` set (see headOnRole) is the resolved case. The robot that detected
+    // the blocker first advances — a sidestep, so the question keeps a real
+    // answer — while the other yields. That asymmetry is what removes the wait:
+    // before this, both were told "stay" and the pair burned STALL_MS 4 s doing
+    // nothing, which measured as ~4.4 s head-on resolution against ~0.22 s for
+    // every other block.
+    //
+    // `role` null is the unresolved case: either nobody compared yet, or the
+    // surrounding code is not running the priority rule. Answering a sidestep
+    // here would make both robots dodge the same way and keep dodging, so the
+    // honest answer with nothing elected is the one that does not invent an
+    // asymmetry that is not there. Callers that DO run the rule pass a role.
+    if (role === "advance") return "left";
+    if (role === "yield") return "stay";
+    // Unresolved: `stalled` is the caller saying waiting has demonstrably failed,
+    // so a sidestep is forced rather than a wait that will not end. Without it,
+    // yield — which is only correct when the other side is advancing.
     return stalled ? "left" : "stay";
   }
   return rel.x > 0 ? "left" : "right";       // away from the blocker
 }
 
-// Options the geometry leaves open. A rack cannot be waited out, and a blocker
-// dead ahead has no "around" to go to, so neither offers the full menu.
-export function feasibleOptions(blockerKind, stalled) {
-  return (blockerKind === "rack" || stalled) ? ["left", "right"] : ["left", "stay", "right"];
+// Options the geometry leaves open, and the exact counterpart of goldDirection —
+// whatever this offers, that function must answer from; whatever it withholds,
+// that function must not answer. The two drifted once and pinned robots in a
+// permanent standoff, so `divergence()` checks them against each other over every
+// blocking situation the sim produces.
+//
+// A rack cannot be waited out. A blocker dead ahead USED to withhold "stay" too,
+// on the grounds that there is no around to go to — which was true and also the
+// bug: with "stay" withdrawn and no side to prefer, the only answers left were
+// two arbitrary directions, and the pair sat until STALL_MS expired. Now the
+// dead band resolves through headOnRole instead: the advance role is offered a
+// sidestep (it must move), the yield role is offered "stay" (moving is not its
+// job), and the two agree because they share one comparison.
+export function feasibleOptions(blockerKind, stalled, role = null) {
+  if (blockerKind === "rack") return ["left", "right"];
+  if (role === "advance") return ["left", "right"];
+  if (role === "yield") return ["left", "stay", "right"];
+  return stalled ? ["left", "right"] : ["left", "stay", "right"];
 }
 
 // ---- dock zone: a rule that does not pay for itself -------------------------
@@ -469,7 +846,9 @@ export function dockZoneOpen(robot, robots, radius = DOCK_ZONE_RADIUS, reserved 
 }
 
 export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = false,
-                                       dockZoneRadius = DOCK_ZONE_RADIUS }) {
+                                       dockZoneRadius = DOCK_ZONE_RADIUS,
+                                       replanAfterSidestep = true,
+                                       sidestepPx = SIDESTEP_PX }) {
   bindWorld(robots);
   const blocked = [];
   for (const robot of robots) {
@@ -523,11 +902,31 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
     const held = !dockVerdict.get(robot.id);
     robot.heldByDock = held;
 
+    // A sidestep that has finished rejoins the plan by PROJECTION, not by asking
+    // the router for a new one — see `rejoinPath` for why re-routing backtracks.
+    // Gated so the difference is measurable rather than assumed.
+    if (replanAfterSidestep && robot.wasSidestepping && now >= robot.sidestepUntil) {
+      rejoinPath(robot);
+    }
+    robot.wasSidestepping = now < robot.sidestepUntil;
+
+    // The head-on election, recomputed from the ABox each tick like the dock
+    // verdict — so it is never stale and lifts by itself once the encounter ends.
+    // A yielding robot holds: it was elected to concede, and the answer it was
+    // given ("stay") means wait, which only works if waiting is actually honoured.
+    // See the head-on priority note above headOnRole for why the election exists.
+    const hRole = headOnRole(robot, robot.obstacle);
+    robot.headOnRole = hRole;
+    const yielding = hRole === "yield";
+    if (yielding) robot.waiting = true;
+
     let vx = 0, vy = 0;
-    if (held) {
+    if (held || yielding) {
       // Tier 0 closes the zone: no movement, and no sidestep either — a sidestep
-      // is still motion, and the rule is about not entering.
-    } else if (now < robot.sidestepUntil) {
+      // is still motion, and the rule is about not entering. The yield case is
+      // the same shape: a robot elected to concede stops, including mid-sidestep,
+      // because continuing to crawl would carry it into the robot it conceded to.
+    } else if (now < robot.sidestepUntil && !sidestepBudgetSpent(robot, sidestepPx)) {
       // perpendicular crawl to get around the obstacle
       const px = Math.cos(robot.heading), py = Math.sin(robot.heading);
       vx = -py * robot.sidestepDir * speed;
@@ -547,7 +946,13 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
             robot.waypoints = routeToDock(robot);
           } else {
             robot.deliveries++;
-            assignTask(robot);
+            // The robot's own rng, not Math.random. Using the default here made
+            // every cycle after the first unseeded, so `createWorld(seed)` was
+            // only deterministic up to the first delivery and two runs of the
+            // same seed diverged — which silently turned every A/B measurement
+            // in this file's history into noise (same seed gave 3,774 / 8,156 /
+            // 9,547 episodes across three runs).
+            assignTask(robot, robot.rng);
           }
           robot.wp = 0;
         }
@@ -597,6 +1002,11 @@ export function applyDecision(robot, action, now) {
     if (!sidestepping) {
       robot.sidestepUntil = now + SIDESTEP_MS;
       robot.sidestepDir = action === "left" ? -1 : 1;
+      // Where this manoeuvre starts, for the distance bound. Fixed here rather than
+      // read live, so a third robot arriving cannot move the goalposts — the reason
+      // the earlier "is it clear" attempts were unstable.
+      robot.sidestepFromX = robot.x;
+      robot.sidestepFromY = robot.y;
     }
   }
 }

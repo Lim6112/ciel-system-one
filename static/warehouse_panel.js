@@ -82,5 +82,11 @@ export function mountWarehousePanel({ root, getSim, onChange }) {
 /** The permitted action set, as the decision loop sees it. */
 export function permittedFor(robot, scan, stalled) {
   const verdict = permittedActions(robot, scan, { stalled });
-  return verdict.options.length ? verdict.options : ["left", "stay", "right"];
+  return {
+    options: verdict.options.length ? verdict.options : ["left", "stay", "right"],
+    // The election the reasoner actually applied, so the caller's displayed gold is
+    // computed with the same role rather than a second, independent guess. See the
+    // note on `derived.headOnRole` in warehouse_ontology.js.
+    role: verdict.headOnRole ?? null,
+  };
 }

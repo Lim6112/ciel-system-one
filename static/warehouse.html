@@ -131,7 +131,24 @@
         <span class="ctl"><label>Lidar range</label>
           <input type="range" id="lidar" min="50" max="150" step="10" value="90">
           <label id="lidarLabel">90 px</label></span>
+        <span class="ctl"><label>Sidestep</label>
+          <input type="range" id="sidestep" min="10" max="1000" step="10" value="1000">
+          <label id="sidestepLabel">unbounded</label></span>
       </div>
+      <p class="meta" style="margin:8px 0 0">
+        <strong>Sidestep</strong> caps how far one evasion manoeuvre may travel. At
+        the maximum it is unbounded, which is the long-standing behaviour; below it,
+        the manoeuvre stops at that distance and the robot resumes its route. Worth
+        trying: the swerve is roughly as large as all forward progress, and nothing
+        has yet measured better than unbounded — six attempts are recorded in
+        <code>warehouse_sim.js</code>.
+        <br>
+        Below <strong>21 px</strong> (two robot radii plus the safety margin) a robot
+        cannot clear another robot at all, so the low end does not shorten the
+        manoeuvre — it makes each one fail and start again, and you will see the
+        swerving get worse rather than better. That end of the range is there to make
+        the failure visible, not because it is worth using.
+      </p>
     </div>
   </section>
 
@@ -201,23 +218,30 @@ async function askCJet(robot, scan, now) {
   const kind = scan.rack ? "rack" : "robot";
   const qid = S.questionId(kind, stalled);
   const question = S.buildQuestion(kind, stalled);
-  const state = S.buildState(robot, scan, now);
+
+  // ONE rule, ONE decision. The ontology's verdict is computed first and supplies
+  // all three things that depend on it: the option set, the head-on election, and —
+  // through the election — the rewrite of the observation below. Every earlier
+  // arrangement here had a second, independent derivation of one of those, and
+  // each one drifted: the option set and the gold disagreed once (a stand-off), the
+  // page and the simulator disagreed once (the page never passed the role at all),
+  // and the state text and the election would have disagreed here if the text were
+  // built before the election was known.
+  const verdict = permittedFor(robot, scan, stalled);
+  const feasible = verdict.options;
+  // The observation is built knowing which robot this is, because a dead-ahead
+  // meeting is rewritten so the one that concedes is told which way to step. See
+  // the rewrite in warehouse_sim.js `buildState`.
+  const state = S.buildState(robot, scan, now, verdict.role);
 
   document.getElementById("whoAsked").textContent =
     `Robot ${robot.id} (${robot.colorName}) asked ${qid} — blocked by ${kind}` +
     (stalled ? ` · stalled ${stalledFor.toFixed(1)} s, "wait" withdrawn` : "");
   document.getElementById("stateView").textContent =
     qid + "\n" + JSON.stringify(state, null, 2);
-
-  // The geometry answer, computed before asking: it is the oracle the eval
-  // scores against and the gate's fallback, so it must not read the model.
-  const oracle = S.goldDirection(scan, stalled);
-  // The permitted set comes from the ontology, not from the sim's own predicate.
-  // It is the same set — that equality is what test_warehouse_ontology.mjs checks
-  // over every blocking situation — but routing the demo through the declaration
-  // is what makes the panel an honest display of the rule in force rather than a
-  // readout of a rule kept somewhere else.
-  const feasible = permittedFor(robot, scan, stalled);
+  // The geometry answer, computed before asking: it is the oracle the eval scores
+  // against, and what the page shows next to the model's answer.
+  const oracle = S.goldDirection(scan, stalled, verdict.role);
   lastScene = { robot, scan, stalled };
 
   try {
@@ -356,7 +380,18 @@ function step(dt, now) {
   S.step(robots, dt, now, {
     speed: speed(), lidarRange: lidarRange(),
     autoplay: document.getElementById("autoplay").checked,
+    sidestepPx: sidestepPx(),
   });
+}
+
+// The slider's value, or null for "unbounded" at the top of its range. Null rather
+// than a large number so the sim's own default path is what the maximum selects —
+// the behaviour that has been measured, not an approximation of it.
+function sidestepPx() {
+  const el = document.getElementById("sidestep");
+  if (!el) return null;
+  const v = Number(el.value);
+  return v >= Number(el.max) ? null : v;
 }
 
 function updateChips() {
@@ -522,6 +557,11 @@ document.getElementById("speed").addEventListener("input", function () {
 });
 document.getElementById("lidar").addEventListener("input", function () {
   document.getElementById("lidarLabel").textContent = `${this.value} px`;
+});
+document.getElementById("sidestep").addEventListener("input", function () {
+  const unbounded = Number(this.value) >= Number(this.max);
+  document.getElementById("sidestepLabel").textContent =
+    unbounded ? "unbounded" : `${this.value} px`;
 });
 
 setInterval(decideTick, 100);   // cheap poll; per-robot lastAsk enforces the real interval
