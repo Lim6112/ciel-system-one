@@ -698,7 +698,25 @@ export const DEADLOCK_QID = "deadlock_escape";
 
 // Once a robot has made no progress for STALL_MS, it stops asking whether to
 // wait and is told to go around instead.
-export function buildQuestion(blockerKind, stalled, deadlocked = false) {
+//
+// `permitted` IS NOT OPTIONAL IN PRACTICE, and passing it is how the question is
+// kept honest. `ciel.py` builds the model's option list from the criteria KEYS, so
+// whatever is in this object is literally what the head may answer -- the ontology's
+// permitted set does not reach the model at all. Before this argument existed, a
+// deadlocked robot was described to the model with four options including `stay`,
+// while the ontology had withdrawn `stay`; the head was being asked a question whose
+// answer it was not allowed to give. Filtering the criteria through the verdict makes
+// the two the same set by construction rather than by two lists agreeing.
+export function buildQuestion(blockerKind, stalled, deadlocked = false, permitted = null) {
+  const allow = (criteria) => {
+    if (!permitted) return criteria;
+    const kept = {};
+    for (const [label, text] of Object.entries(criteria)) {
+      if (permitted.includes(label)) kept[label] = text;
+    }
+    return Object.keys(kept).length ? kept : criteria;
+  };
+
   // THE DEADLOCK QUESTION, which is a different question and not a wider one. Every
   // other branch here asks which way to go; this one asks whether to go at all. The
   // robot has already tried `left`/`right` for DEADLOCK_MS and is still stuck, so
@@ -713,13 +731,17 @@ export function buildQuestion(blockerKind, stalled, deadlocked = false) {
       type: "choice",
       instructions: "You are a warehouse delivery robot and you have been stuck " +
         "for a long time. Sidestepping has not freed you. What should you do now?",
-      criteria: {
+      // `stay` is listed here so that a caller passing no `permitted` still gets the
+      // long-standing shape, but a caller that HAS the verdict will have it filtered
+      // out -- a deadlocked robot is stalled by definition, so waiting is the one
+      // option escalation has already removed.
+      criteria: allow({
         backward: "reverse away from the obstacle along the path I came in on, " +
           "to open the space I am wedged in",
         left: "sidestep to my left to pass the obstacle",
         stay: "yield and wait, because the obstacle is about to clear my path",
         right: "sidestep to my right to pass the obstacle",
-      },
+      }),
     };
   }
   if (blockerKind === "rack" || stalled) {
@@ -728,10 +750,10 @@ export function buildQuestion(blockerKind, stalled, deadlocked = false) {
       instructions: "You are a warehouse delivery robot. Something is blocking " +
         "your path and will not move out of the way on its own. In which " +
         "direction should you sidestep to pass it?",
-      criteria: {
+      criteria: allow({
         left: "sidestep to my left to pass the obstacle",
         right: "sidestep to my right to pass the obstacle",
-      },
+      }),
     };
   }
   return {
@@ -739,11 +761,11 @@ export function buildQuestion(blockerKind, stalled, deadlocked = false) {
     instructions: "You are a warehouse delivery robot. Another robot is blocking " +
       "your path ahead. It may move on its own. In which direction should you " +
       "move to resolve the blockage?",
-    criteria: {
+    criteria: allow({
       left: "move to my left to get around the obstacle, then merge back to my route",
       stay: "yield and wait, because the obstacle is about to clear my path",
       right: "move to my right to get around the obstacle, then merge back to my route",
-    },
+    }),
   };
 }
 

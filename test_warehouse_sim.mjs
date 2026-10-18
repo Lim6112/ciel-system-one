@@ -764,3 +764,44 @@ test("the escape reverses along the incoming heading", () => {
       `heading ${heading}: ${JSON.stringify(v)} is not the reverse of ${JSON.stringify(forward)}`);
   }
 });
+
+test("the question's options are exactly the permitted set", () => {
+  // The bug this catches is not cosmetic. `ciel.py` builds the model's option list
+  // from the criteria KEYS, so a criteria object that disagrees with the permitted
+  // set means the head is choosing from a menu the ontology did not authorise -- and
+  // the ontology's own verdict never reaches the model at all. Observed for a
+  // deadlocked robot: the axiom had withdrawn `stay`, the question still offered it,
+  // and `stay` is the one answer escalation exists to remove.
+  const cases = [
+    ["rack",    false, false, ["left", "right"]],
+    ["robot",   false, false, ["left", "stay", "right"]],
+    ["robot",   true,  false, ["left", "right"]],
+    ["rack",    false, true,  ["backward", "left", "right"]],
+    ["robot",   true,  true,  ["backward", "left", "right"]],
+  ];
+  for (const [kind, stalled, deadlocked, permitted] of cases) {
+    const q = buildQuestion(kind, stalled, deadlocked, permitted);
+    assert.deepEqual(Object.keys(q.criteria), permitted,
+      `${kind} stalled=${stalled} deadlocked=${deadlocked} offered the wrong set`);
+  }
+});
+
+test("a deadlocked robot is never asked to wait", () => {
+  // A deadlocked robot has been stalled for longer than STALL_MS by definition, so
+  // `stay` has already been withdrawn. Offering it again asks the model a question
+  // whose answer has demonstrably failed -- measured live: with `stay` on the menu
+  // the untrained head answers it, and the wedge never clears.
+  const q = buildQuestion("robot", true, true, ["backward", "left", "right"]);
+  assert.ok(!("stay" in q.criteria), `wait was offered: ${JSON.stringify(Object.keys(q.criteria))}`);
+  assert.ok("backward" in q.criteria, "the escape was not offered");
+  // And the option order leads with the escape, so the priority is readable.
+  assert.equal(Object.keys(q.criteria)[0], "backward");
+});
+
+test("omitting the permitted set keeps the legacy shape", () => {
+  // Callers that do not have a verdict must keep working; the filter is additive.
+  assert.deepEqual(Object.keys(buildQuestion("robot", false, false).criteria),
+    ["left", "stay", "right"]);
+  assert.deepEqual(Object.keys(buildQuestion("robot", true, true).criteria),
+    ["backward", "left", "stay", "right"]);
+});

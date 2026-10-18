@@ -291,7 +291,6 @@ async function askCJet(robot, scan, now) {
   const deadlocked = !!robot.deadlocked;
   const kind = scan && scan.rack ? "rack" : "robot";
   const qid = S.questionId(kind, stalled, deadlocked);
-  const question = S.buildQuestion(kind, stalled, deadlocked);
 
   // ONE rule, ONE decision. The ontology's verdict is computed first and supplies
   // all three things that depend on it: the option set, the head-on election, and —
@@ -303,6 +302,12 @@ async function askCJet(robot, scan, now) {
   // built before the election was known.
   const verdict = permittedFor(robot, scan, stalled, deadlocked);
   const feasible = verdict.options;
+  // THE QUESTION IS BUILT FROM THE VERDICT, not beside it. `ciel.py` turns the
+  // criteria KEYS into the model's option list, so a criteria object that disagrees
+  // with the permitted set means the head is choosing from a menu the ontology did
+  // not authorise -- which is exactly what happened for a deadlocked robot, where
+  // the question still offered `stay` after the axiom had withdrawn it.
+  const question = S.buildQuestion(kind, stalled, deadlocked, verdict.options);
   // The observation is built knowing which robot this is, because a dead-ahead
   // meeting is rewritten so the one that concedes is told which way to step. See
   // the rewrite in warehouse_sim.js `buildState`.
