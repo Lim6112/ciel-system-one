@@ -399,6 +399,32 @@ export function bindWorld(robots) {
 // not a free lunch, and if fairness ever matters more than latency the
 // `blockedSince` version is the one to bring back.
 //
+// WHAT THIS RULE STILL GETS WRONG, kept here because the attempt to fix it was
+// reverted and the diagnosis is the expensive part. Watching the live page, the
+// yielding robot WAITS FOR A ROBOT THAT IS NOT COMING: it holds at a fixed spot
+// with "stay" while the robot elected to advance has already passed, or is dodging
+// and returning to its own route without ever clearing the path. Escalation breaks
+// it at the STALL_MS price every time, which is why robot-vs-robot blocks in the
+// browser measure p90 ~4.7 s with 6 of 39 over 4 s, while rack blocks (which never
+// yield) are 0 of 51. Measured in the page, not in a harness.
+//
+// Three fixes were tried and all were reverted, with the numbers:
+//   - both robots dodge, nobody yields. Better in the harness, worse in the page:
+//     agreement with the model fell to 40%, because the trained head learned `stay`
+//     for a head-on blocker and this stops producing it. A gold change needs a
+//     retrain, not a code change.
+//   - end the sidestep early once the lane clears (`|rel.x| >= MIN_SEP`). Helped,
+//     but a rack hit carries no `rel`, so "no rel" read as "clear" and every rack
+//     sidestep restarted each tick — 70,560 encounters where there had been 9,000.
+//   - re-plan from the post-sidestep position (`replanFrom`). Made it worse:
+//     routeToRack/routeToDock build their L-chain from the current position and
+//     reset `wp = 0`, so the first leg is often backwards — 3,585 deliveries became
+//     2,759, sidestep travel per delivery 475 px became 662 px.
+// The one change that DID measure as a clear win and was also reverted with the
+// rest: `warehouse.html` passing `role` into `goldDirection`. Without it the page
+// silently used the unresolved branch while the simulator and every harness run had
+// moved on — see the note at that call site.
+//
 // `role` is "advance" for the lower id, "yield" for the other. Returns null for
 // anything that is not a dead-ahead encounter, so callers can fall through to the
 // ordinary gold.
