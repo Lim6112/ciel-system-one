@@ -311,7 +311,9 @@ async function askCJet(robot, scan, now) {
   // The observation is built knowing which robot this is, because a dead-ahead
   // meeting is rewritten so the one that concedes is told which way to step. See
   // the rewrite in warehouse_sim.js `buildState`.
-  const state = S.buildState(robot, scan, now, verdict.role, deadlocked);
+  // The deadlock sentence comes from the axiom (`stateLeaf`), so the observation and
+  // the rule that admits the escape cannot describe different situations.
+  const state = S.buildState(robot, scan, now, verdict.role, deadlocked, verdict.stateLeaf);
 
   document.getElementById("whoAsked").textContent =
     `Robot ${robot.id} (${robot.colorName}) asked ${qid} — ` +

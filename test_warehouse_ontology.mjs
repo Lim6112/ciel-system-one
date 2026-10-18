@@ -192,3 +192,70 @@ test("the escape axiom rejects illegal backward in both directions", () => {
   assert.ok(under.violations.some(v => v.axiom === "deadlocked-robot-may-reverse"),
     "withholding backward from a deadlocked robot was not reported");
 });
+
+// ---- the escape axiom is the SOURCE of the capability, not a check on it -----
+//
+// Every other axiom in this file works one way round: the code computes the
+// permitted set and the axiom verifies the computation, so deleting the axiom stops
+// the check and leaves the behaviour. This one has to work the other way, because
+// its entire content is "the ontology admits this action" -- a hardcoded set beside
+// it would make the declaration decoration. These two tests pin both halves of that:
+// the permission AND the sentence the observation carries are read off the axiom, so
+// deleting it withdraws both together.
+
+test("the escape set comes from the axiom, not a constant beside it", () => {
+  const robot = { id: "R1", x: 200, y: 200, heading: 0 };
+  const withAxiom = permittedActions(robot, null, { stalled: true, deadlocked: true });
+  assert.deepEqual(withAxiom.options, ["backward", "left", "right"]);
+
+  const idx = TBOX.findIndex(a => a.id === "deadlocked-robot-may-reverse");
+  const removed = TBOX.splice(idx, 1)[0];
+  try {
+    const without = permittedActions(robot, null, { stalled: true, deadlocked: true });
+    assert.ok(!without.options.includes("backward"),
+      `the escape survived its own deletion: [${without.options}]`);
+    // It falls back to the ORDINARY set -- this robot has no scan, so that is the
+    // full three-way avoid set, not the two-way sidestep set. The point of the
+    // assertion is that it is the set the robot would have had without the deadlock
+    // concept at all, rather than a hardcoded escape.
+    assert.deepEqual(without.options, ["left", "stay", "right"]);
+    assert.ok(without.unasserted.includes("deadlocked-robot-may-reverse"),
+      "the deletion was not reported");
+  } finally {
+    TBOX.splice(idx, 0, removed);
+  }
+});
+
+test("the observation's deadlock sentence comes from the axiom too", () => {
+  // The sentence and the permission must stand or fall together. If the wording were
+  // hardcoded in the simulator, deleting the axiom would leave the model still being
+  // told the robot is wedged while the ontology had stopped saying so -- the same
+  // one-rule-two-homes shape that produced the head-on standoff.
+  const robot = { id: "R1", x: 200, y: 200, heading: 0, phase: "toPickup", colorName: "red" };
+  const before = permittedActions(robot, null, { stalled: true, deadlocked: true });
+  assert.ok(before.stateLeaf && before.stateLeaf.deadlock,
+    "the axiom contributes no wording to the observation");
+  // It must describe the situation and NOT name the action: the model has to choose
+  // `backward` from the criteria, or the agreement counter measures the prompt.
+  assert.ok(!/backward|reverse/i.test(before.stateLeaf.deadlock),
+    `the observation gives the answer away: ${before.stateLeaf.deadlock}`);
+
+  const idx = TBOX.findIndex(a => a.id === "deadlocked-robot-may-reverse");
+  const removed = TBOX.splice(idx, 1)[0];
+  try {
+    const after = permittedActions(robot, null, { stalled: true, deadlocked: true });
+    assert.deepEqual(after.stateLeaf, {},
+      `the sentence outlived the axiom: ${JSON.stringify(after.stateLeaf)}`);
+  } finally {
+    TBOX.splice(idx, 0, removed);
+  }
+});
+
+test("a non-deadlocked robot gets no deadlock wording", () => {
+  // The leaf is gated on the same flag as the permission, so a merely blocked robot
+  // cannot be described as wedged.
+  const robot = { id: "R1", x: 200, y: 200, heading: 0 };
+  const v = permittedActions(robot, null, { stalled: false, deadlocked: false });
+  assert.deepEqual(v.stateLeaf, {});
+  assert.ok(!v.options.includes("backward"));
+});

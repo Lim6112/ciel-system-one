@@ -831,7 +831,8 @@ function sideToName(robot, scan) {
   return HEAD_ON_NAME;
 }
 
-export function buildState(robot, scan, now = 0, role = null, deadlocked = false) {
+export function buildState(robot, scan, now = 0, role = null, deadlocked = false,
+                           stateLeaf = null) {
   const others = robot.others
     ? robot.others.filter(o => o !== robot.id)
         .map(id => describeOther(robot, id))
@@ -850,15 +851,22 @@ export function buildState(robot, scan, now = 0, role = null, deadlocked = false
 
   // THE DEADLOCK STATE, which is the one state the lidar cannot produce. A robot
   // wedged against something outside its cone has `scan === null`, so nothing below
-  // this branch would run and it would never be asked anything -- measured at 53.6%
-  // of all stuck-in-contact ticks. The escape option exists for exactly this, so the
-  // state has to be constructible from the robot's clocks alone.
+  // this branch would run and it would never be asked anything.
   //
-  // One leaf, `deadlock`, and it says plain enough what the situation is. It is
-  // added to every deadlocked state whether or not an obstacle is visible, because
-  // the two are the same problem to the robot: it has not moved for 8 s.
-  if (deadlocked) {
-    doc.deadlock = "wedged, no progress for 8s";
+  // THE WORDING COMES FROM THE AXIOM, passed in as `stateLeaf`, not from a literal
+  // here. It used to be hardcoded, which meant the sentence describing the deadlock
+  // and the rule permitting the escape lived in two files and could disagree: with
+  // the axiom deleted in the live editor the observation would still claim the robot
+  // was wedged while the ontology had stopped saying so. That is the same
+  // one-rule-two-homes shape this project has already been bitten by twice (the
+  // head-on election, and the option set vs the gold).
+  //
+  // What the leaf may SAY is the constraint: it states the facts -- that the robot is
+  // wedged and for how long -- and names no action. The model has to choose
+  // `backward` from the criteria; telling it the answer in the observation would
+  // turn the agreement counter into a measure of the prompt rather than the model.
+  if (deadlocked && stateLeaf) {
+    Object.assign(doc, stateLeaf);
   }
   if (!scan) return doc;
 

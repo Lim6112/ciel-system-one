@@ -146,6 +146,21 @@ export const TBOX = [
     subject: "DeadlockedRobot",
     property: "permittedAction",
     value: ["backward", "left", "right"],
+    // The wording the state carries, kept ON the axiom rather than in the simulator.
+    // `buildState` writes this into the doc it sends the model, so deleting this
+    // axiom removes the sentence as well as the permission — otherwise the model
+    // would keep being told the robot is wedged while the ontology had stopped
+    // saying so, which is one rule living in two places.
+    //
+    // IT SAYS WHAT IS WRONG, NOT WHAT TO DO. The leaf reports that sidestepping has
+    // failed and that progress has stopped; it does not name an action. The
+    // distinction is the difference between an observation and a hint: this document
+    // describes a scene, and the answer has to come from the criteria. Saying
+    // "reversing is required" here would make the model's 0.79 look like judgement
+    // when it was dictation, and would make the page's agreement counter measure the
+    // prompt instead of the head. If the model cannot pick `backward` from a
+    // question that offers it, that is a result worth seeing, not one to pre-empt.
+    stateLeaf: { deadlock: "wedged, no progress for 8s; sidestepping has not freed me" },
     comment:
       "Tier 1. A deadlocked robot -- stuck AND blocked for DEADLOCK_MS (8 s) -- is " +
       "permitted to reverse, which no other state permits. This is the only axiom here " +
@@ -202,9 +217,28 @@ export function buildABox(robot, scan, opts = {}) {
   // reach it independently from `blockedSince`.
   const role = blocked && !staticBlocker ? roleOf(robot, scan) : null;
 
-  const permitted = blocked
-    ? (deadlocked ? DEADLOCK_SET : options(staticBlocker ? "rack" : "robot", stalled, role))
-    : deadlocked ? DEADLOCK_SET : ACTION_SET;
+  // The escape set is READ OFF THE AXIOM, and this is the one place in the file where
+  // an axiom is the SOURCE of behaviour rather than a check on it. Every other rule
+  // here works the other way round: `feasibleOptions` computes the set and the axiom
+  // verifies the computation, so deleting one stops the check but leaves the options
+  // alone. That is fine for a rule whose implementation is a ternary; it is not fine
+  // for this one, where the whole capability is "the ontology admits it". A literal
+  // `DEADLOCK_SET` here meant the axiom's `value` was only ever compared against the
+  // set the code already used, so removing the declaration in the live editor left
+  // the escape fully working and the declaration was decoration.
+  //
+  // WITH NO AXIOM THERE IS NO ESCAPE, so the robot falls back to the ordinary set
+  // rather than to a hardcoded escape. Crashing is still not an option and `reason()`
+  // still reports the axiom as unasserted -- but the capability goes with the
+  // declaration, because that is what makes the declaration load-bearing.
+  const escapeRule = axiom("deadlocked-robot-may-reverse");
+  const escapeSet = (escapeRule && Array.isArray(escapeRule.value) && escapeRule.value.length)
+    ? escapeRule.value : null;
+
+  const ordinary = blocked
+    ? options(staticBlocker ? "rack" : "robot", stalled, role)
+    : ACTION_SET;
+  const permitted = (deadlocked && escapeSet) ? escapeSet : ordinary;
 
   const facts = { individuals: new Map() };
   const add = (id, type, props = {}) => {
@@ -509,6 +543,7 @@ export function permittedActions(robot, scan, opts = {}) {
     v.axiom === "deadlocked-robot-may-reverse" ||
     v.axiom === "blocked-robot-has-permitted-set");
   const options = probe.derived.permitted;
+  const escapeRule = axiom("deadlocked-robot-may-reverse");
   return {
     options: options.length ? options : ACTION_SET,
     // Carried out so a caller can compute its own gold with the election this
@@ -517,6 +552,12 @@ export function permittedActions(robot, scan, opts = {}) {
     // And the deadlock flag, for the same reason: a caller that wants to build its
     // question must not have to re-derive the gating the ontology just applied.
     deadlocked: probe.derived.deadlocked ?? false,
+    // THE SENTENCE THE STATE CARRIES, taken off the axiom that admitted the escape
+    // rather than written into the simulator. Empty once the axiom is gone, so
+    // deleting it in the live editor stops the observation from claiming the robot
+    // is wedged at the same moment it stops permitting the escape -- see `stateLeaf`.
+    stateLeaf: (probe.derived.deadlocked && escapeRule && escapeRule.stateLeaf)
+      ? escapeRule.stateLeaf : {},
     ok: blocking.length === 0,
     violations: blocking,
     allViolations: probe.violations,
