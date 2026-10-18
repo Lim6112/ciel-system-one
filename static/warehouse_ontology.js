@@ -152,15 +152,24 @@ export const TBOX = [
     // would keep being told the robot is wedged while the ontology had stopped
     // saying so, which is one rule living in two places.
     //
-    // IT SAYS WHAT IS WRONG, NOT WHAT TO DO. The leaf reports that sidestepping has
-    // failed and that progress has stopped; it does not name an action. The
-    // distinction is the difference between an observation and a hint: this document
-    // describes a scene, and the answer has to come from the criteria. Saying
-    // "reversing is required" here would make the model's 0.79 look like judgement
-    // when it was dictation, and would make the page's agreement counter measure the
-    // prompt instead of the head. If the model cannot pick `backward` from a
-    // question that offers it, that is a result worth seeing, not one to pre-empt.
-    stateLeaf: { deadlock: "wedged, no progress for 8s; sidestepping has not freed me" },
+    // IT SAYS WHAT IS WRONG, NOT WHAT TO DO. The leaf reports that the robot is
+    // wedged and for how long; it does not name an action. This document describes a
+    // scene, and the answer has to come from the criteria: naming the move here would
+    // make the model's confidence look like judgement when it was dictation, and
+    // would make the page's agreement counter measure the prompt instead of the head.
+    //
+    // An earlier version read "wedged, no progress for 8s; sidestepping has not freed
+    // me", and it was shortened on the theory that mentioning sidestepping pulled the
+    // head toward the `left`/`right` criteria, which also say "sidestep". THAT THEORY
+    // IS NOT SUPPORTED: measured against the live service, both sentences answer
+    // `backward` on the warehouse head (0.78 for the short one, 0.57 for the long one)
+    // and on the service default (0.57 / 0.72), so the extra clause changes the
+    // margin but never the choice. The shorter sentence is kept because it is shorter
+    // and says the same thing, not because it fixed anything.
+    //
+    // What DOES change the answer is the sub-path, and the note at the bottom of this
+    // axiom's comment is the thing to read before puzzling over a `left` here.
+    stateLeaf: { deadlock: "wedged, no progress for 8s" },
     comment:
       "Tier 1. A deadlocked robot -- stuck AND blocked for DEADLOCK_MS (8 s) -- is " +
       "permitted to reverse, which no other state permits. This is the only axiom here " +
@@ -170,7 +179,21 @@ export const TBOX = [
       "ACTION_SET so that it cannot appear in the everyday choice; the range is what " +
       "admits it. Reversing is not free -- it gives up route already driven -- which is " +
       "why it is gated on the two clocks rather than offered whenever a robot is " +
-      "blocked.",
+      "blocked. " +
+      // The measured failure mode, recorded where someone debugging a wrong answer will
+      // actually be reading. It is NOT the observation text, which was the first
+      // suspect and a dead end: both wordings answer `backward`.
+      "WHICH HEAD YOU ASK DECIDES THIS ONE. Measured against the live service on the " +
+      "same wedged state and the same three options -- " +
+      "warehouse sub-path: backward 0.81/0.92/0.99/0.77 across four state shapes; " +
+      "service default (doc): backward 0.58/0.69/0.59/0.49; " +
+      "typed sub-path: left or right, backward never above 0.33. " +
+      "The `typed` head is trained on typed-decisions and has no warehouse training, " +
+      "so it cannot answer this question at all -- and because it always returns one " +
+      "of the options it was sent, the failure looks like a considered `left` rather " +
+      "than the out-of-domain answer it is. `ciel_typed_v1` in the Model dropdown " +
+      "reaches that sub-path. If a deadlock answers `left`, check the dropdown before " +
+      "touching the state text.",
   },
 ];
 
