@@ -151,6 +151,14 @@
       <div class="meta" id="decisionMeta">no decisions yet</div>
       <div id="history"></div>
     </div>
+    <div class="panel">
+      <h2>Ontology — which actions are permitted</h2>
+      <p class="meta" style="margin-top:0">
+        The declared rule behind the option set. Removing an axiom stops it being
+        enforced, and the panel says so rather than failing.
+      </p>
+      <div id="ontologyPanel"></div>
+    </div>
   </section>
 </main>
 
@@ -162,6 +170,7 @@
 // too, so the browser and the harness cannot drift apart. This file is only the
 // DOM layer over it.
 import * as S from "./warehouse_sim.js";
+import { mountWarehousePanel, permittedFor } from "./warehouse_panel.js";
 
 // ---- sim state --------------------------------------------------------------
 
@@ -182,6 +191,10 @@ let decided = 0, deferred = 0;
 // intended behaviour — a gate reused across models does not mis-set itself, it
 // silently disables itself, so the number is per-model and the counter is visible.
 let CONF_FLOOR = 0.9;
+
+// The most recent blocking scene, for the ontology panel's ABox row. Replaced each
+// time a robot asks; the panel reads whatever is current.
+let lastScene = null;
 
 const canvas = document.getElementById("sim");
 const ctx = canvas.getContext("2d");
@@ -212,7 +225,13 @@ async function askCJet(robot, scan, now) {
   // The geometry answer, computed before asking: it is the oracle the eval
   // scores against and the gate's fallback, so it must not read the model.
   const oracle = S.goldDirection(scan, stalled);
-  const feasible = S.feasibleOptions(kind, stalled);
+  // The permitted set comes from the ontology, not from the sim's own predicate.
+  // It is the same set — that equality is what test_warehouse_ontology.mjs checks
+  // over every blocking situation — but routing the demo through the declaration
+  // is what makes the panel an honest display of the rule in force rather than a
+  // readout of a rule kept somewhere else.
+  const feasible = permittedFor(robot, scan, stalled);
+  lastScene = { robot, scan, stalled };
 
   try {
     const response = await fetch("/api/predict", {
@@ -509,6 +528,22 @@ document.getElementById("lidar").addEventListener("input", function () {
 });
 
 setInterval(decideTick, 100);   // cheap poll; per-robot lastAsk enforces the real interval
+
+// The ontology panel. It reads the live scene, so a blocked robot's permitted set
+// is shown as the ontology computes it — and editing the TBox changes what the
+// panel reports, including reporting an axiom as unasserted once it is removed.
+const ontologyRoot = document.getElementById("ontologyPanel");
+if (ontologyRoot) {
+  // mountTBoxEditor paints into `root` itself and returns nothing, so the repaint
+  // is just a re-mount — which is also what its own onChange does.
+  const repaintOntology = () => mountWarehousePanel({
+    root: ontologyRoot,
+    getSim: () => lastScene,
+    onChange: () => repaintOntology(),
+  });
+  repaintOntology();
+  setInterval(repaintOntology, 500);
+}
 
 // debug/inspection hook: current robot states
 window.__simState = () => robots.map(r => ({

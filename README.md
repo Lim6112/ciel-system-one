@@ -220,6 +220,48 @@ Re-derive the oracle numbers with `node eval_warehouse.mjs --model ciel_warehous
 that per-side accuracy and confusion table is the evidence for the head, and the
 `--model ciel_decision_model_v1` run is the before picture.
 
+#### The option set is a declared rule, not a ternary
+
+The rule that removes "wait" from the menu is stated as axioms, not as the
+hand-written predicate it used to be. `static/warehouse_ontology.js` is the third
+TBox/ABox domain beside `ontology.js` (fleet) and `breakout_ontology.js`, sharing
+the domain-free editor in `ontology_core.js`:
+
+```
+StaticBlocker  ⊥ Stay          a rack never yields, so waiting it out is provably wrong
+StalledBlocker ⊥ Stay          once waiting has demonstrably failed it is not an answer
+StaticBlocker  ⊥ MobileBlocker  a blocker is one kind or the other
+BlockedRobot ⊑ ≥1 goldAction   a blocked robot has an action that clears it
+BlockedRobot ⊑ ≥1 permittedAction   …and at least one legal move
+```
+
+Two things about this are worth stating plainly.
+
+**The axiom form is constrained by the subset, and that shaped the declaration.**
+`ontology_core.js` implements `maxCardinality` / `minCardinality` / `range` /
+`disjoint` — no negation and no implication — so "a static blocker implies `stay`
+is not permitted" cannot be written directly. It is written as a disjointness
+instead, which is the same claim once `Stay` is a class: the permitted-action set
+of a `StaticBlocker` does not contain it.
+`checkTBox` rejects any axiom whose form nothing implements, so a declared rule
+cannot silently go unconsulted.
+
+**The declaration is only worth having because it is checked against the code.**
+`divergence()` runs both the ontology and `feasibleOptions` over every blocking
+situation the simulator produces — 20,000 cases across ten seeds — and
+`test_warehouse_ontology.mjs` asserts zero disagreements. Without that check this
+would be a *second* home for the rule, which is strictly worse than one. That is
+not hypothetical here: the two halves of this rule (which options are offered, and
+which answer is correct) lived in separate functions, drifted, and pinned robots
+in a permanent head-on standoff — 791 deferred against 40 decided.
+
+This is also the one claim the domain *can* keep, and it is weaker than the other
+two demos'. On fleet, turning the ontology on must not change any decision, and
+that holds by construction. Here it cannot: removing an option **is** the change,
+by design. So the note in the panel says so instead of claiming otherwise. The
+demo routes its option set through the ontology, so the panel shows the rule
+actually in force — a rack block reads `permitted left/right`.
+
 #### A rule that reads well and measures badly
 
 The dock is where contention actually is — **54.4% of all blocked ticks** in a 60 s
