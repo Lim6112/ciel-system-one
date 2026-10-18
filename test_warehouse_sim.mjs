@@ -28,6 +28,7 @@ import {
   headingIn,
   hitsRack,
   inDockZone,
+  nearestAisle,
   nearestCorridor,
   questionId,
   rejoinPath,
@@ -194,6 +195,28 @@ test("a sidestep takes the robot's progress, not just a timer", () => {
   advance(robots, { maxTicks: 400 });
   assert.ok(Math.hypot(r.x - before.x, r.y - before.y) > 1,
     "robot did not move at all");
+});
+
+test("nearestAisle returns the nearer aisle", () => {
+  // Added after this function was quietly broken for the length of one edit: the
+  // reduce branches were swapped, so it returned the FARTHEST aisle and every
+  // route crossed the board twice. Nothing caught it, because every other test in
+  // this file asserts an end-to-end outcome (deliveries, pickups, blocked time)
+  // and none asserted a lane choice -- the same blind spot the original
+  // `nearestCorridor` bug lived in until an outcome happened to expose it. The
+  // cost of that miss: pickups fell to 2 in a 60 s run, which reads as a routing
+  // catastrophe and not as "one comparison is backwards".
+  assert.equal(nearestAisle(321), 380);   // nearest of 140/260/380
+  assert.equal(nearestAisle(200), 140);
+  assert.equal(nearestAisle(100), 140);
+  assert.equal(nearestAisle(490), 380);
+  assert.equal(nearestAisle(260), 260);
+  // And it must agree with an explicit nearest-neighbour search everywhere, which
+  // is the property the swapped branches violated.
+  for (let x = 0; x <= 520; x++) {
+    const want = [140, 260, 380].reduce((a, b) => Math.abs(b - x) < Math.abs(a - x) ? b : a);
+    assert.equal(nearestAisle(x), want, `nearestAisle(${x})`);
+  }
 });
 
 test("nearestCorridor returns the nearer corridor", () => {

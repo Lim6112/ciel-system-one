@@ -43,7 +43,16 @@ export { HOUSE };
 export const PX_PER_M = 10;
 export const ROBOT_R = 9;
 export const MIN_SEP = 2 * ROBOT_R + 3;                   // hard collision safety
+
+// Lidar half-angle: the default, and the slider range the page exposes.
+// 45 deg was the only value this sim ever ran, hard-coded at the scan site. It is
+// now a parameter because the demo wants to show what the cone width buys, and
+// because the value is doing real work: a narrower cone sees a cross-traffic robot
+// later, so the robot commits further into an encounter before it has any reason
+// to yield. Default unchanged so every pinned number still describes this build.
 export const LIDAR_HALF_ANGLE = 45 * Math.PI / 180;
+export const LIDAR_ANGLE_MIN = 5 * Math.PI / 180;         // narrowest the slider allows
+export const LIDAR_ANGLE_MAX = 90 * Math.PI / 180;        // widest; >90 would see behind
 // 1500 ms, i.e. ~119 px at demo speed, and MEASURED AS SPENT IN FULL: every
 // completed sidestep ran 1488 ms and travelled 119 px, to the millisecond and the
 // pixel. Two robots are 18 px across and need to clear each other by MIN_SEP (21 px),
@@ -154,8 +163,38 @@ export const ROUTES = {
 export const fmtM = px => `${Math.max(1, Math.round(px / PX_PER_M))} m`;
 
 // ---- navigation -------------------------------------------------------------
-// Robots move only along safe lines: corridors are clear horizontally, aisle
-// gaps are clear vertically. Any route is a corridor/aisle L-shaped chain.
+// Robots move along a uniform 50 px navigation grid laid over the floor, and a
+// route is a shortest path through it (Dijkstra, 8-connected, edges checked
+// against the racks).
+//
+// WHY NOT THE HAND-BUILT L-CHAIN. Routes used to be assembled from the lane
+// NEAREST to the robot and the lane NEAREST to the goal, chosen independently by
+// proximity. When the nearest aisle is on the far side of the goal, the chain
+// crosses the goal's aisle to reach it and then comes back. Swept over all 10,902
+// free start positions x 9 goals (96,606 routes), that router travelled 17.06%
+// more than a free-space shortest path, and 34.5% of its routes contained a
+// direction reversal. Choosing among the SAME lanes by where the goal is rather
+// than by proximity removes essentially all of it (1.23% over a free-space
+// optimum) -- so the cost was never the lane set, it was the local choice. A
+// shortest path makes the choice globally, which is also what makes the old
+// failure mode unrepresentable: `nearestCorridor` once shipped with its branches
+// swapped and routed R1 in one straight line through both rack rows, pinning it
+// at spawn with 0 deliveries. A grid search cannot produce a leg it has not
+// checked against the racks.
+//
+// THE GRID SPACING IS 50 px BECAUSE THE PAGE DRAWS IT. 50 px also measures best
+// here: 85 free nodes, nothing unreachable, and 1.06% over a free-space optimum
+// (45 px: +1.55%, 40 px: +7.61% -- finer is worse, because extra lane changes in
+// the corridor bands cost more than the shorter legs buy).
+//
+// ONE HONEST ASYMMETRY, kept rather than tuned away. The rack gaps are centred at
+// x=140/260/380, and no 50 px lattice hits all three: the origin that puts a line
+// at 150 misses 380, the one that hits 380 misses 140. So the east gap (355-405)
+// has no grid line inside it and paths thread it diagonally, passing 10.6 px from
+// a rack corner against the 9 px the robot needs. That is a 1.6 px margin, thin.
+// It is left as measured rather than special-cased, and `nearestAisle` below is
+// kept because the grid does not cover every question the sim asks.
+export const GRID_PX = 50;
 
 export function clamp(value, lo, hi) {
   return Math.min(hi, Math.max(lo, value));
@@ -174,9 +213,8 @@ export function nearestCorridor(y) {
   // the first leg's y, so R1 at y=390 was routed to (55,146) — one straight line
   // from the bottom of the board to the top, straight through both rack rows,
   // which the hard collision check then refused, pinning the robot at its spawn
-  // with 0 deliveries. Route legs must only ever travel along y=146/238/330
-  // (rows are clear horizontally) or x=140/260/380 (aisles are clear
-  // vertically); the old first leg satisfied neither.
+  // with 0 deliveries. The grid router cannot make this class of mistake, but the
+  // function is still used by lane readouts, so the fix stays and is pinned.
   return CORRIDOR_YS.reduce((a, b) => Math.abs(b - y) < Math.abs(a - y) ? b : a);
 }
 
@@ -193,7 +231,181 @@ function cleanPath(pts, from) {
     i > 0 && (Math.abs(p.x - all[i - 1].x) > 0.5 || Math.abs(p.y - all[i - 1].y) > 0.5));
 }
 
-export function routeToRack(robot, rack) {
+// ---- the navigation grid ----------------------------------------------------
+
+// True when a straight leg between two points clears every rack. Sampled rather
+// than solved.
+//
+// THE STEP IS 1 px, AND THAT IS NOT CAUTION, IT IS A BUG FIX. At 2 px this test
+// passed a leg that crossed a rack corner 8.9 px clear of a robot centre's 9 px
+// requirement: the two samples either side straddled the shallow intersection and
+// both landed outside it, so the router accepted a leg the physics then refused.
+// A leg is at most one grid diagonal (71 px), so 1 px costs at most 72 `hitsRack`
+// calls -- and `hitsRack` is 8 rectangle tests, which is nothing next to the
+// Dijkstra around it. The measured clearance margin on the diagonal that threads
+// the east aisle is 1.6 px, which is smaller than a 2 px step can resolve.
+const LEG_SAMPLE_PX = 1;
+// The cargo house is solid too. It is NOT in `hitsRack` (which is about racks, and
+// is what the physics and the rack-lidar both use), so a grid built from `hitsRack`
+// alone leaves drivable nodes INSIDE the building -- and a shortest path walking
+// through the house is not just unphysical, it is a large shortcut that the old
+// corridor-and-aisle router could never take. Observed on seed 42: R2 parked at
+// (213,72), inside the house, cycling without delivering.
+function insideHouse(x, y) {
+  return x > HOUSE.x && x < HOUSE.x + HOUSE.w && y > HOUSE.y && y < HOUSE.y + HOUSE.h;
+}
+function blockedAt(x, y) {
+  return hitsRack(x, y) || insideHouse(x, y);
+}
+function legClear(a, b) {
+  const n = Math.max(2, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / LEG_SAMPLE_PX));
+  // Endpoints are skipped, so the final leg may END at the dock on the house's
+  // edge without that count as crossing the house.
+  for (let i = 1; i < n; i++) {
+    const t = i / n;
+    if (blockedAt(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)) return false;
+  }
+  return true;
+}
+
+// The grid is fixed geometry, so it is built once and reused. Nodes inside a rack
+// are dropped; edges are the 8 neighbours whose leg clears the racks.
+const GRID_NODES = [];
+const GRID_ADJ = [];
+(() => {
+  const xs = [], ys = [];
+  for (let x = 0; x <= W; x += GRID_PX) xs.push(x);
+  for (let y = 0; y <= H; y += GRID_PX) ys.push(y);
+  const index = new Map();
+  for (let i = 0; i < xs.length; i++) {
+    for (let j = 0; j < ys.length; j++) {
+      if (blockedAt(xs[i], ys[j])) continue;
+      index.set(i + "," + j, GRID_NODES.length);
+      GRID_NODES.push({ x: xs[i], y: ys[j], i, j });
+    }
+  }
+  for (const node of GRID_NODES) GRID_ADJ.push([]);
+  // MANHATTAN, NOT CHEBYSHEV. Diagonals were tried first because they are shorter
+  // and the free-space optimum above is measured with them -- but they measured
+  // catastrophically worse closed-loop (300 deliveries against a 1029 baseline),
+  // because a diagonal cuts a rack corner the robot cannot actually take: at 50 px
+  // spacing a diagonal passes 10.6 px from a corner against the 9 px needed. Worse,
+  // the legs that thread the east aisle are diagonals, so "the shortest path" the
+  // search prefers is the one with the least clearance and the most chance of
+  // being refused by the hard collision check mid-manoeuvre. Axis-aligned legs at
+  // this spacing reproduce the corridor-and-aisle structure the robots were
+  // already navigating, while being chosen globally instead of by proximity.
+  const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  for (let k = 0; k < GRID_NODES.length; k++) {
+    const node = GRID_NODES[k];
+    for (const [di, dj] of DIRS) {
+      const m = index.get((node.i + di) + "," + (node.j + dj));
+      if (m === undefined) continue;
+      const other = GRID_NODES[m];
+      if (!legClear(node, other)) continue;
+      GRID_ADJ[k].push([m, Math.hypot(other.x - node.x, other.y - node.y)]);
+    }
+  }
+})();
+
+export const GRID_NODE_COUNT = GRID_NODES.length;
+
+// The grid nodes a given point can reach in one clear leg. A robot mid-route is
+// almost never ON a grid node, so every search starts and ends through these.
+function spokes(p) {
+  const out = [];
+  for (let k = 0; k < GRID_NODES.length; k++) {
+    if (!legClear(p, GRID_NODES[k])) continue;
+    out.push([k, Math.hypot(GRID_NODES[k].x - p.x, GRID_NODES[k].y - p.y)]);
+  }
+  return out;
+}
+
+// Small binary min-heap over [dist, nodeIndex]. Grown once and reused, because a
+// route is planned on every task assignment and an array sort per push is the
+// difference between a 1 ms plan and a visible stall.
+const HEAP = [];
+function heapPush(heap, dist, k) {
+  heap.push([dist, k]);
+  let c = heap.length - 1;
+  while (c > 0) {
+    const p = (c - 1) >> 1;
+    if (heap[p][0] <= heap[c][0]) break;
+    const t = heap[p]; heap[p] = heap[c]; heap[c] = t;
+    c = p;
+  }
+}
+function heapPop(heap) {
+  const top = heap[0], last = heap.pop();
+  if (heap.length) {
+    heap[0] = last;
+    let p = 0;
+    for (;;) {
+      const l = 2 * p + 1, r = l + 1;
+      let m = p;
+      if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+      if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+      if (m === p) break;
+      const t = heap[p]; heap[p] = heap[m]; heap[m] = t;
+      p = m;
+    }
+  }
+  return top;
+}
+
+// Shortest grid path from `from` to `to`, as a waypoint list with `from` itself
+// excluded (the caller's position is implicit, as `cleanPath` assumed). Returns
+// null when no route exists, which the callers fall back from rather than throw
+// on -- a robot with no path is better than a crashed demo.
+export function planRoute(from, to) {
+  const start = spokes(from);
+  const goal = spokes(to);
+  if (start.length === 0 || goal.length === 0) return null;
+  const goalCost = new Map(goal);
+  // Any goal node is a valid exit, so the search stops at the first one popped
+  // rather than at a single target node.
+  const dist = new Map();
+  const prev = new Map();
+  const done = new Set();
+  HEAP.length = 0;
+  for (const [k, d] of start) {
+    if (d < (dist.get(k) ?? Infinity)) { dist.set(k, d); prev.set(k, null); heapPush(HEAP, d, k); }
+  }
+  let best = null;
+  while (HEAP.length) {
+    const [d, k] = heapPop(HEAP);
+    if (done.has(k) || d > (dist.get(k) ?? Infinity)) continue;
+    done.add(k);
+    if (goalCost.has(k)) { best = { node: k, cost: d + goalCost.get(k) }; break; }
+    for (const [m, w] of GRID_ADJ[k]) {
+      const nd = d + w;
+      if (nd < (dist.get(m) ?? Infinity)) { dist.set(m, nd); prev.set(m, k); heapPush(HEAP, nd, m); }
+    }
+  }
+  if (best === null) return null;
+  const chain = [];
+  for (let at = best.node; at !== null && at !== undefined; at = prev.get(at)) chain.push(at);
+  chain.reverse();
+  // EVERY node on the chain is a waypoint, including the entry node. Dropping the
+  // entry node looks harmless -- `from` is where the robot already is -- but it is
+  // not: the cost to the entry node is the cost of the leg `from` -> entry, so
+  // removing it makes the first waypoint the SECOND node and the robot drives
+  // straight at it, cutting the corner across whatever the entry node was there to
+  // avoid. Measured with it dropped: R2 at (465,390) routed to (500,200) in one
+  // straight leg, passing 8.9 px from rack B4 against the 9 px it needs -- refused
+  // by the hard collision check, and pickups fell from a full run to 42.
+  const pts = chain.map(k => ({ x: GRID_NODES[k].x, y: GRID_NODES[k].y }));
+  pts.push({ x: to.x, y: to.y });
+  // `cleanPath` removes the entry node when the robot is already standing on it,
+  // which is the one case where it carries no information.
+  return cleanPath(pts, from);
+}
+
+// The original hand-built router, kept as the default and as the comparison arm.
+// It picks the lane NEAREST the robot and the lane NEAREST the goal independently,
+// which is what back-tracks when the nearest aisle is on the far side of the goal;
+// see the header note above for the measured cost and for why it still wins.
+export function chainToRack(robot, rack) {
   const pickX = rack.x + rack.w / 2;
   const cy = nearestCorridor(robot.y), ty = rackCorridor(rack);
   const a0 = nearestAisle(robot.x), a1 = nearestAisle(pickX);
@@ -204,13 +416,102 @@ export function routeToRack(robot, rack) {
   return cleanPath(pts, robot);
 }
 
-export function routeToDock(robot) {
+export function chainToDock(robot) {
   const cy = nearestCorridor(robot.y), ty = CORRIDOR_YS[0];
   const a = nearestAisle(robot.x);
   const pts = [{ x: robot.x, y: cy }, { x: a, y: cy }];
   if (cy !== ty) pts.push({ x: a, y: ty });
   pts.push({ x: DOCK.x, y: ty }, DOCK);
   return cleanPath(pts, robot);
+}
+
+// A route that arrives at `to` travelling ALONG `axis`, by routing to a staging
+// point offset from the goal and then running the last leg straight in.
+//
+// THIS IS NOT COSMETIC, and it is the one thing that broke when routing became a
+// shortest path. The hand-built router always arrived at a pick point travelling
+// along the corridor, so the rack it came to load sat squarely to its side. A
+// shortest path has no such preference and readily delivers the robot at a right
+// angle -- and a robot that ends its route FACING the rack it just reached reads
+// that rack on the next lidar scan as an obstacle 28 px dead ahead, sidesteps away
+// from its own goal, and never docks. Measured on seed 42: arrival headings of 180
+// and 270 deg, both facing the target rack, 2 deliveries against a 49 baseline.
+//
+// The staging point is placed on the robot's side of the goal, so the final leg
+// runs from staging to the goal in the direction of travel and the heading at
+// arrival is the axis -- perpendicular to the rack, which is what keeps the rack
+// out of the forward cone.
+const APPROACH_PX = 30;
+export function approachRoute(from, to, axis) {
+  const alongX = axis === "horizontal";
+  const fromC = alongX ? from.x : from.y;
+  const toC = alongX ? to.x : to.y;
+  const sign = fromC <= toC ? -1 : 1;          // stage on the side we approach from
+  const stage = alongX
+    ? { x: to.x + sign * APPROACH_PX, y: to.y }
+    : { x: to.x, y: to.y + sign * APPROACH_PX };
+  // The staging point must itself be reachable and the final leg clear, or the
+  // pinned approach buys a heading at the cost of a route that crosses a rack.
+  if (!legClear(stage, to)) return planRoute(from, to);
+  const head = planRoute(from, stage);
+  if (!head || head.length === 0) return planRoute(from, to);
+  return [...head, { x: to.x, y: to.y }];
+}
+
+// The pickup point for a rack is where a robot can stand to load it: in front of
+// the rack, on the corridor its row is served from. Kept as a named helper
+// because three call sites (router, gold, tests) must agree on it exactly.
+export function rackPickPoint(rack) {
+  return { x: rack.x + rack.w / 2, y: rackCorridor(rack) };
+}
+
+// WHICH ROUTER IS IN USE, and why the choice is a switch rather than a change.
+//
+// The hand-built L-chain is the DEFAULT, because it still measures best end to
+// end. Over ten seeds x 60 s with the geometry oracle as the policy:
+//
+//   hand-built L-chain (default)   1029 deliveries   1070 px forward/delivery
+//   grid shortest path              662 deliveries   1527 px forward/delivery
+//
+// The grid is genuinely better at the thing it was built to fix -- its routes are
+// 17% SHORTER, no leg it produces crosses a rack, and it cannot reproduce the
+// nearest-lane bug class. It still loses on throughput, and the mechanism is worth
+// recording because it is not obvious: a shortest path is free to use MANY lanes,
+// while the hand-built router pins every robot to three corridors and three
+// aisles. On three lanes, two robots meeting are reliably head-on and the priority
+// election fires; across ~20 lanes they pass each other offset, the election
+// returns null (|rel.x| is outside HEAD_ON_BAND_PX), and both dodge. Widening the
+// band was measured and is not the fix (12 px -> 226, 30 px -> 294, 50 px -> 209,
+// against 1029). The lane count is the variable, and a finer grid raises it. So
+// the honest summary is that route LENGTH and route DISCRIPLINE trade against each
+// other here, and the default keeps the one that delivers.
+//
+// `navRouter` selects between them at runtime so the comparison is one call, not a
+// git stash. See the navigation-router slider in warehouse.html.
+let NAV_ROUTER = "chain";
+export function navRouter() { return NAV_ROUTER; }
+export function setNavRouter(name) { NAV_ROUTER = name === "grid" ? "grid" : "chain"; }
+
+export function routeToRack(robot, rack) {
+  const goal = rackPickPoint(rack);
+  // Arrive ALONG the corridor, so the target rack stays lateral and out of the
+  // forward cone. See `approachRoute` for what a square-on arrival costs.
+  const pts = NAV_ROUTER === "grid" ? approachRoute(robot, goal, "horizontal")
+                                    : chainToRack(robot, rack);
+  // Falling back to a single leg keeps a robot moving even if the grid somehow has
+  // no spoke to it. Never an empty path: `step` reads an empty waypoint list as
+  // "arrived" and would fire a phase change from a failed plan.
+  if (!pts || pts.length === 0) return cleanPath([goal], robot);
+  return pts;
+}
+
+export function routeToDock(robot) {
+  // The dock sits at (260,90); the old router reached it from the left along the
+  // top corridor, (240,146) -> (260,90), so pin the vertical approach to match.
+  const pts = NAV_ROUTER === "grid" ? approachRoute(robot, DOCK, "vertical")
+                                    : chainToDock(robot);
+  if (!pts || pts.length === 0) return cleanPath([DOCK], robot);
+  return pts;
 }
 
 // ---- robots -----------------------------------------------------------------
@@ -301,7 +602,7 @@ export function rayHitsRack(robot, range) {
   return { rack: best.rack, dist: best.dist, lateral: toRack.x };
 }
 
-export function scanLidar(robot, robots, range) {
+export function scanLidar(robot, robots, range, halfAngle = LIDAR_HALF_ANGLE) {
   let best = null;
   for (const other of robots) {
     if (other === robot) continue;
@@ -309,7 +610,7 @@ export function scanLidar(robot, robots, range) {
     const dist = Math.hypot(rel.x, rel.y);
     if (dist > range) continue;
     const angle = Math.abs(Math.atan2(rel.x, Math.max(0, rel.y)));
-    if (rel.y < 0 || angle > LIDAR_HALF_ANGLE) continue;
+    if (rel.y < 0 || angle > halfAngle) continue;
     if (!best || dist < best.dist) best = { other: other.id, rack: null, dist, rel };
   }
   const rackHit = rayHitsRack(robot, range);
@@ -848,11 +1149,12 @@ export function dockZoneOpen(robot, robots, radius = DOCK_ZONE_RADIUS, reserved 
 export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = false,
                                        dockZoneRadius = DOCK_ZONE_RADIUS,
                                        replanAfterSidestep = true,
-                                       sidestepPx = SIDESTEP_PX }) {
+                                       sidestepPx = SIDESTEP_PX,
+                                       lidarHalfAngle = LIDAR_HALF_ANGLE }) {
   bindWorld(robots);
   const blocked = [];
   for (const robot of robots) {
-    const scan = scanLidar(robot, robots, lidarRange);
+    const scan = scanLidar(robot, robots, lidarRange, lidarHalfAngle);
     robot.obstacle = scan;
     robot.others = robots.map(r => r.id);
     if (scan) {

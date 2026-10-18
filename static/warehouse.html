@@ -131,6 +131,14 @@
         <span class="ctl"><label>Lidar range</label>
           <input type="range" id="lidar" min="50" max="150" step="10" value="90">
           <label id="lidarLabel">90 px</label></span>
+        <span class="ctl"><label>Lidar angle</label>
+          <input type="range" id="lidarAngle" min="5" max="90" step="5" value="45">
+          <label id="lidarAngleLabel">45°</label></span>
+        <span class="ctl"><label>Router</label>
+          <select id="router">
+            <option value="chain" selected>chain — 3 lanes, fewer deadlocks</option>
+            <option value="grid">grid — 50 px, shorter paths</option>
+          </select></span>
         <span class="ctl"><label>Sidestep</label>
           <input type="range" id="sidestep" min="10" max="1000" step="10" value="1000">
           <label id="sidestepLabel">unbounded</label></span>
@@ -148,6 +156,25 @@
         manoeuvre — it makes each one fail and start again, and you will see the
         swerving get worse rather than better. That end of the range is there to make
         the failure visible, not because it is worth using.
+        <br><br>
+        <strong>Lidar angle</strong> is the half-width of the forward cone. It affects
+        robot-vs-robot detection only: a rack is found by a straight ray down the
+        heading, deliberately <em>not</em> by the cone, so that a robot aimed through a
+        50 px aisle does not read the flanking rack corners as a wall ahead
+        (<code>warehouse_sim.js</code>, <code>rayHitsRack</code>). Narrow the cone and
+        a robot sees a crossing counterpart later, commits further into the encounter,
+        and has less room to yield — which is why the default, not the widest setting,
+        is what every measured number in this file was taken at.
+        <br><br>
+        <strong>Router</strong> switches the path planner and is the fair comparison in
+        reverse: the <em>grid</em> router plans over a uniform 50 px lattice with
+        Dijkstra, so its routes are 17% shorter and none of its legs crosses a rack —
+        but it delivers <strong>36% fewer</strong> cycles (662 against 1029 over ten
+        seeds). A shortest path is free to use ~20 lanes, while the <em>chain</em>
+        router pins every robot to three corridors and three aisles; on three lanes a
+        meeting is reliably head-on and the priority election fires, whereas offset
+        lane-to-lane passes leave both robots dodging. Route length and route discipline
+        trade against each other, and the default keeps the one that delivers.
       </p>
     </div>
   </section>
@@ -206,6 +233,12 @@ const ctx = canvas.getContext("2d");
 
 function speed() { return Number(document.getElementById("speed").value); }
 function lidarRange() { return Number(document.getElementById("lidar").value); }
+// The slider is in degrees because that is what the label reads; the sim takes
+// radians. Default 45 deg is the constant every measured number was taken at.
+function lidarHalfAngle() {
+  const el = document.getElementById("lidarAngle");
+  return el ? Number(el.value) * Math.PI / 180 : S.LIDAR_HALF_ANGLE;
+}
 
 // ---- CJet decision loop ------------------------------------------------------
 
@@ -378,7 +411,7 @@ function step(dt, now) {
   updateChips();
 
   S.step(robots, dt, now, {
-    speed: speed(), lidarRange: lidarRange(),
+    speed: speed(), lidarRange: lidarRange(), lidarHalfAngle: lidarHalfAngle(),
     autoplay: document.getElementById("autoplay").checked,
     sidestepPx: sidestepPx(),
   });
@@ -478,7 +511,7 @@ function draw() {
       ctx.beginPath();
       ctx.moveTo(robot.x, robot.y);
       ctx.arc(robot.x, robot.y, lidarRange(),
-        robot.heading - S.LIDAR_HALF_ANGLE, robot.heading + S.LIDAR_HALF_ANGLE);
+        robot.heading - lidarHalfAngle(), robot.heading + lidarHalfAngle());
       ctx.closePath();
       ctx.fill();
     }
@@ -521,6 +554,9 @@ function frame(t) {
 // ---- wiring -------------------------------------------------------------------
 
 function startSim() {
+  // The router is module state read at planning time, so apply the select before
+  // createWorld plans the first routes.
+  S.setNavRouter(document.getElementById("router").value);
   // A fresh world each run; the module seeds its own RNG from this.
   robots = S.createWorld(Math.floor(Math.random() * 1e9));
   running = true; paused = false;
@@ -558,11 +594,37 @@ document.getElementById("speed").addEventListener("input", function () {
 document.getElementById("lidar").addEventListener("input", function () {
   document.getElementById("lidarLabel").textContent = `${this.value} px`;
 });
+document.getElementById("lidarAngle").addEventListener("input", function () {
+  // Say what the low end does, because the effect is not obvious from the number:
+  // a very narrow cone makes rack hits the only thing a robot ever notices.
+  const deg = Number(this.value);
+  document.getElementById("lidarAngleLabel").textContent =
+    deg <= 10 ? `${deg}° (nearly blind)` : `${deg}°`;
+});
+document.getElementById("router").addEventListener("change", function () {
+  // The router is read at PLANNING time, so a robot already mid-route keeps the
+  // path it has. Restart so the switch takes effect immediately and the two arms
+  // are not mixed within one run.
+  S.setNavRouter(this.value);
+  startSim();
+});
 document.getElementById("sidestep").addEventListener("input", function () {
   const unbounded = Number(this.value) >= Number(this.max);
   document.getElementById("sidestepLabel").textContent =
     unbounded ? "unbounded" : `${this.value} px`;
 });
+
+// Keep the cone slider's bounds tied to the sim's own constants rather than
+// restating them here, so the two cannot drift the way the lidar angle itself once
+// did (it was hard-coded at the scan site with no way to vary it at all).
+(() => {
+  const el = document.getElementById("lidarAngle");
+  if (!el) return;
+  el.min = Math.round(S.LIDAR_ANGLE_MIN * 180 / Math.PI);
+  el.max = Math.round(S.LIDAR_ANGLE_MAX * 180 / Math.PI);
+  el.value = Math.round(S.LIDAR_HALF_ANGLE * 180 / Math.PI);
+  document.getElementById("lidarAngleLabel").textContent = `${el.value}°`;
+})();
 
 setInterval(decideTick, 100);   // cheap poll; per-robot lastAsk enforces the real interval
 
