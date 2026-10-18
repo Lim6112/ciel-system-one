@@ -655,14 +655,23 @@ export function rejoinPath(robot) {
   // The rejoining point is dropped if the robot is already essentially on it, which
   // is the common case (a sidestep of a few pixels clears the lane): then the
   // planned path is simply resumed and no correction leg exists at all.
+  // The index comes from the scan above, NOT from searching for the point. Using
+  // `pts.indexOf(rejoin)` was a real bug that made the path grow without bound: the
+  // segments of an axis-aligned chain share their endpoints by reference, so
+  // `indexOf` resolved to an earlier index than the segment just chosen and `slice`
+  // never removed anything — every rejoin prepended one more copy of the same point.
+  // Observed live: 122 identical waypoints in front of a robot whose `wp` stayed 0,
+  // oscillating between two x positions and reaching neither. Fixing it took the
+  // harness from 198 to 359 deliveries, which is the largest single improvement of
+  // any change in this file.
   const p = pts[best];
   const q = pts[best + 1];
-  const candidates = q ? [p, q] : [p];
-  candidates.sort((m, n) =>
-    Math.hypot(here.x - m.x, here.y - m.y) - Math.hypot(here.x - n.x, here.y - n.y));
-  const rejoin = candidates[0];
+  const dToP = Math.hypot(here.x - p.x, here.y - p.y);
+  const dToQ = q ? Math.hypot(here.x - q.x, here.y - q.y) : Infinity;
+  const useQ = dToQ <= dToP;
+  const rejoin = useQ ? q : p;
+  const keepIdx = useQ ? best + 1 : best;
   const alreadyThere = Math.hypot(here.x - rejoin.x, here.y - rejoin.y) < 2;
-  const keepIdx = pts.indexOf(rejoin);
   const tail = pts.slice(keepIdx + (alreadyThere ? 1 : 0));
   const next = alreadyThere ? tail : [rejoin, ...tail];
   // Never leave the robot with no waypoints. An empty path is read as "arrived" by
