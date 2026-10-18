@@ -131,7 +131,18 @@
         <span class="ctl"><label>Lidar range</label>
           <input type="range" id="lidar" min="50" max="150" step="10" value="90">
           <label id="lidarLabel">90 px</label></span>
+        <span class="ctl"><label>Sidestep</label>
+          <input type="range" id="sidestep" min="100" max="1000" step="20" value="1000">
+          <label id="sidestepLabel">unbounded</label></span>
       </div>
+      <p class="meta" style="margin:8px 0 0">
+        <strong>Sidestep</strong> caps how far one evasion manoeuvre may travel. At
+        the maximum it is unbounded, which is the long-standing behaviour; below it,
+        the manoeuvre stops at that distance and the robot resumes its route. Worth
+        trying: the swerve is roughly as large as all forward progress, and nothing
+        has yet measured better than unbounded — six attempts are recorded in
+        <code>warehouse_sim.js</code>.
+      </p>
     </div>
   </section>
 
@@ -363,7 +374,18 @@ function step(dt, now) {
   S.step(robots, dt, now, {
     speed: speed(), lidarRange: lidarRange(),
     autoplay: document.getElementById("autoplay").checked,
+    sidestepPx: sidestepPx(),
   });
+}
+
+// The slider's value, or null for "unbounded" at the top of its range. Null rather
+// than a large number so the sim's own default path is what the maximum selects —
+// the behaviour that has been measured, not an approximation of it.
+function sidestepPx() {
+  const el = document.getElementById("sidestep");
+  if (!el) return null;
+  const v = Number(el.value);
+  return v >= Number(el.max) ? null : v;
 }
 
 function updateChips() {
@@ -529,6 +551,11 @@ document.getElementById("speed").addEventListener("input", function () {
 });
 document.getElementById("lidar").addEventListener("input", function () {
   document.getElementById("lidarLabel").textContent = `${this.value} px`;
+});
+document.getElementById("sidestep").addEventListener("input", function () {
+  const unbounded = Number(this.value) >= Number(this.max);
+  document.getElementById("sidestepLabel").textContent =
+    unbounded ? "unbounded" : `${this.value} px`;
 });
 
 setInterval(decideTick, 100);   // cheap poll; per-robot lastAsk enforces the real interval

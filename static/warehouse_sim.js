@@ -106,7 +106,29 @@ export const LIDAR_HALF_ANGLE = 45 * Math.PI / 180;
 // So the swerving is not a tunable surplus. If it is to come down, the route has to
 // stop putting robots head-on in the first place — which is a planning change, not a
 // manoeuvre change. Five attempts to fix it in the manoeuvre are recorded above.
+// How far a sidestep may travel, in pixels — the knob the demo exposes.
+//
+// A DEFAULT, not a law. The manoeuvre used to be bounded by SIDESTEP_MS alone, which
+// at demo speed is ~119 px; the slider lets that be traded against throughput live,
+// because the honest position is that this file does not know the right value. Six
+// attempts to derive one are recorded below and every one measured worse.
+//
+// `null` means "unbounded": travel until the timer runs out, which is the long-
+// standing behaviour and the only arm that has survived measurement. Any number here
+// bounds the distance instead; see `sidestepBudgetSpent` for why the bound is a
+// number fixed at decision time rather than a live "is it clear" test.
+export const SIDESTEP_PX = null;
+
+// The timer that caps a sidestep regardless of distance, so a slow robot cannot
+// crawl indefinitely. Was the only bound until SIDESTEP_PX was added.
 export const SIDESTEP_MS = 1500;
+
+export function sidestepBudgetSpent(robot, budgetPx) {
+  if (budgetPx == null) return false;
+  const dx = robot.x - robot.sidestepFromX;
+  const dy = robot.y - robot.sidestepFromY;
+  return Math.hypot(dx, dy) >= budgetPx;
+}
 
 // Escalation: how long a robot may make NO forward progress before it stops
 // asking "how do I resolve this" and starts being told to go around.
@@ -202,6 +224,9 @@ export function makeRobot(rid, rng = Math.random) {
     phase: "toPickup", pickupRack: null,   // toPickup -> toDock -> loop
     heading: 0, waiting: false,
     sidestepUntil: 0, sidestepDir: 0,
+    // Where this sidestep started, so its distance can be bounded. See
+    // `sidestepBudgetSpent` and SIDESTEP_PX.
+    sidestepFromX: 0, sidestepFromY: 0,
     // stall tracking: blockedSince is the raw obstacle timer (kept for the
     // readout), lastProgressAt is what actually drives escalation
     blockedSince: null, lastProgressAt: 0, lastProgressX: spec.start.x,
@@ -822,7 +847,8 @@ export function dockZoneOpen(robot, robots, radius = DOCK_ZONE_RADIUS, reserved 
 
 export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = false,
                                        dockZoneRadius = DOCK_ZONE_RADIUS,
-                                       replanAfterSidestep = true }) {
+                                       replanAfterSidestep = true,
+                                       sidestepPx = SIDESTEP_PX }) {
   bindWorld(robots);
   const blocked = [];
   for (const robot of robots) {
@@ -900,7 +926,7 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
       // is still motion, and the rule is about not entering. The yield case is
       // the same shape: a robot elected to concede stops, including mid-sidestep,
       // because continuing to crawl would carry it into the robot it conceded to.
-    } else if (now < robot.sidestepUntil) {
+    } else if (now < robot.sidestepUntil && !sidestepBudgetSpent(robot, sidestepPx)) {
       // perpendicular crawl to get around the obstacle
       const px = Math.cos(robot.heading), py = Math.sin(robot.heading);
       vx = -py * robot.sidestepDir * speed;
@@ -976,6 +1002,11 @@ export function applyDecision(robot, action, now) {
     if (!sidestepping) {
       robot.sidestepUntil = now + SIDESTEP_MS;
       robot.sidestepDir = action === "left" ? -1 : 1;
+      // Where this manoeuvre starts, for the distance bound. Fixed here rather than
+      // read live, so a third robot arriving cannot move the goalposts — the reason
+      // the earlier "is it clear" attempts were unstable.
+      robot.sidestepFromX = robot.x;
+      robot.sidestepFromY = robot.y;
     }
   }
 }
