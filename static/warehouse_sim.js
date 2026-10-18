@@ -326,16 +326,36 @@ function legClear(a, b) {
 
 // The grid is fixed geometry, so it is built once and reused. Nodes inside a rack
 // are dropped; edges are the 8 neighbours whose leg clears the racks.
+//
+// NODES A ROBOT CENTRE CANNOT OCCUPY ARE DROPPED TOO, and that is a bug fix rather
+// than tidiness. The loop walks `x = 0; x <= W`, so it put nodes ON the walls -- 19
+// of 83, the whole x=0 and y=0 edges. `blockedAt` does not object to them, because a
+// wall is neither a rack nor the house, so the planner was free to route through
+// them. A robot cannot follow: the physics clamps its centre to the floor, so it
+// stops with its centre at ROBOT_R=9 while the waypoint sits at 0, `dist < 5` is
+// never satisfied, and it presses into the wall for the rest of the run. Measured
+// on seed 368866214: R1 pinned at (9.00, 200.00) facing -x for 958 s of a 960 s run,
+// with route [[0,200],[50,146],[80,146]].
+//
+// THE LINES STAY ON MULTIPLES OF GRID_PX, and the unreachable ones are FILTERED OUT
+// rather than the origin being nudged inward. Shifting the origin to ROBOT_R looks
+// equivalent and is a large regression: the aisle gaps are centred at x=140/260/380
+// and only a line at exactly 150/250/350 threads them, so moving the lattice by 9 px
+// leaves every gap without a lane in it and deliveries collapse (measured: 50 s pickups
+// fell to 29 on the seed the suite checks). Filter, do not shift.
+const GRID_MARGIN = ROBOT_R;
 const GRID_NODES = [];
 const GRID_ADJ = [];
 (() => {
   const xs = [], ys = [];
   for (let x = 0; x <= W; x += GRID_PX) xs.push(x);
   for (let y = 0; y <= H; y += GRID_PX) ys.push(y);
+  const reachable = (x, y) => x >= GRID_MARGIN && x <= W - GRID_MARGIN
+                            && y >= GRID_MARGIN && y <= H - GRID_MARGIN;
   const index = new Map();
   for (let i = 0; i < xs.length; i++) {
     for (let j = 0; j < ys.length; j++) {
-      if (blockedAt(xs[i], ys[j])) continue;
+      if (blockedAt(xs[i], ys[j]) || !reachable(xs[i], ys[j])) continue;
       index.set(i + "," + j, GRID_NODES.length);
       GRID_NODES.push({ x: xs[i], y: ys[j], i, j });
     }

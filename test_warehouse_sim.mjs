@@ -36,8 +36,11 @@ import {
   nearestAisle,
   nearestCorridor,
   questionId,
+  ROBOT_R,
   SEPARATION_PX,
   setNavRouter,
+  W,
+  H,
   rejoinPath,
   scanLidar,
   step,
@@ -266,6 +269,39 @@ test("no route leg crosses a rack", () => {
       }
     }
   }
+});
+
+test("every planned waypoint is somewhere a robot centre can stand", () => {
+  // THE INVARIANT THAT WAS VIOLATED, and the failure it caused. The navigation grid
+  // was built with `x = 0; x <= W`, so it put nodes ON the walls -- 19 of 83, the
+  // whole x=0 and y=0 edges. Nothing objected, because a wall is neither a rack nor
+  // the house, so the planner happily routed through them. A robot cannot follow:
+  // the physics clamps its centre to the floor, so it halts with its centre at
+  // ROBOT_R while the waypoint sits at 0, the `dist < 5` arrival test is never
+  // satisfied, and it presses into the wall until the run ends.
+  //
+  // Observed: seed 368866214, R1 pinned at (9.00, 200.00) facing -x for 958 s of a
+  // 960 s run with the route [[0,200],[50,146],[80,146]] -- the exact "R1 stuck in
+  // the corner after a restart" report. After the fix the same seed delivers 289.
+  //
+  // Checked against BOTH routers because the invariant is about the physics, not
+  // about either planner: a waypoint no robot can occupy is un-followable whatever
+  // produced it.
+  for (const router of ["grid", "chain"]) {
+    setNavRouter(router);
+    for (const seed of [1, 2, 3, 5, 7, 11, 42, 368866214]) {
+      for (const robot of createWorld(seed)) {
+        for (const p of robot.waypoints) {
+          assert.ok(p.x >= ROBOT_R - 1e-6 && p.x <= W - ROBOT_R + 1e-6
+                 && p.y >= ROBOT_R - 1e-6 && p.y <= H - ROBOT_R + 1e-6,
+            `${router} seed ${seed} ${robot.id}: waypoint (${p.x},${p.y}) is outside ` +
+            `the band a robot centre can reach ([${ROBOT_R},${W - ROBOT_R}] x ` +
+            `[${ROBOT_R},${H - ROBOT_R}]) — the robot will press into the wall forever`);
+        }
+      }
+    }
+  }
+  setNavRouter("grid");
 });
 
 test("a robot reaches its pickup rack and delivers", () => {
