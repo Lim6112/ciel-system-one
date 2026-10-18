@@ -44,6 +44,34 @@ export const PX_PER_M = 10;
 export const ROBOT_R = 9;
 export const MIN_SEP = 2 * ROBOT_R + 3;                   // hard collision safety
 export const LIDAR_HALF_ANGLE = 45 * Math.PI / 180;
+// 1500 ms, i.e. ~119 px at demo speed, and MEASURED AS SPENT IN FULL: every
+// completed sidestep ran 1488 ms and travelled 119 px, to the millisecond and the
+// pixel. Two robots are 18 px across and need to clear each other by MIN_SEP (21 px),
+// so the manoeuvre spends roughly six times what the obstacle requires, and at ~8.5
+// sidesteps per delivery (972 px of swerve against 982 px of actual route progress)
+// nearly all of the swerving is surplus.
+//
+// THREE ATTEMPTS TO SPEND LESS, ALL REVERTED. Recorded because each looked obviously
+// right and each measured worse, and the reasons are not guessable:
+//
+//   - stop when the forward cone clears. A robot steps just far enough to lose sight
+//     of the obstacle and stops — still standing in the other robot's lane, so it is
+//     re-blocked next tick. Encounters went 9,000 -> 70,560.
+//   - stop when `|rel.x| >= MIN_SEP` against `robot.obstacle`. The reference is
+//     re-read every tick, so in a three-robot pileup it keeps changing, `|rel.x|`
+//     never accumulates, and the advancer sidesteps forever while the other two
+//     yield: three robots at 300+ s of no progress, deliveries 226 -> 160.
+//   - the same test against a referent frozen when the manoeuvre starts. A rack
+//     appearing mid-sidestep reads as "different blocker", ends the manoeuvre on the
+//     tick it begins, and it restarts: deliveries 226 -> 73, 205,000 ticks blocked
+//     on racks.
+//
+// The common failure is that "is the obstacle clear" is a question about a scene
+// that keeps changing while the robot acts on it, and every cheap answer to it has
+// been unstable. Racks make it worse: a rack hit is a straight-ray distance with no
+// lateral offset, so the one signal the robot-blocks use does not exist for them.
+// What would work is deciding the exit distance ONCE, at decision time, from the
+// blocker then in front, and holding it for the manoeuvre — not re-deriving it.
 export const SIDESTEP_MS = 1500;
 
 // Escalation: how long a robot may make NO forward progress before it stops
