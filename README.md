@@ -127,18 +127,262 @@ honest decomposition in
 ### laya runs the warehouse
 
 `static/warehouse.html` (linked from the UI header) simulates a cargo house
-and three delivery robots on crossing routes, each with a forward lidar. When
-a robot's lidar sees another robot blocking its path, it serializes the
-situation to prose (who is ahead and how far, other robots' relative positions
-and motions, deliveries completed, seconds blocked) and asks laya
-`move: choice(left/stay/right)` — left/right sidestep around the obstacle,
-stay waits — so laya resolves the multi-agent blocking/deadlock problem. The screen
-shows the canvas with lidar cones and route lines, per-robot lidar chips,
-"Laya's view" (the state text the blocked robot sent) and "Laya's decisions"
-(action bars, confidence, latency, history). Hard collision prevention is
-independent of laya — physics never lets robots overlap; laya decides
-strategy. Toggle autoplay off to watch blocked robots stop forever: the
-deadlock laya prevents.
+and three delivery robots on crossing routes, each with a forward lidar. When a
+robot's lidar sees its path blocked, it serializes the situation to **a flat JSON
+state** and asks laya a question about the blocker. The screen shows the canvas
+with lidar cones and route lines, per-robot lidar chips, "Laya's view" (the exact
+JSON the blocked robot sent) and "Laya's decisions" (action bars, confidence,
+latency, history, and — next to every decision — what the geometry says the answer
+should be and whether the model agreed). An **Ontology** panel shows the declared
+rule that decides which directions are offered. Hard collision prevention is
+independent of laya — physics never lets robots overlap; laya decides strategy.
+Toggle autoplay off to watch blocked robots stop forever: the deadlock laya prevents.
+
+**There are two blockers and they are two different problems**, so the demo asks
+two different questions. A **storage rack** is static and never yields — waiting
+is *provably* wrong, so `stay` is not offered at all and the question is a 2-way
+`sidestep_direction` whose gold is the side with more room. Another **robot** can
+yield, so it gets the 3-way `avoid_direction`, where `stay` means *I give way* (a
+priority rule), not "the obstacle will clear". Measured over the recorded traffic,
+62% of blocks are racks (110/178) — so most of this demo is static avoidance, not
+multi-agent deadlock.
+
+The sim lives in `static/warehouse_sim.js` — a pure, seeded, DOM-free module.
+`warehouse.html` is only the DOM layer over it, and `eval_warehouse.mjs` imports
+the same file, so the browser and the harness cannot drift apart.
+
+#### The doc head answers this domain by surface form, not geometry
+
+`model=ciel_decision_model_v1` (the doc/breakout head) collapsed to a single
+action on warehouse states: **171 of 178** recorded decisions were `right`,
+reproduced live at 8/8, and it stayed `right` with the option order reversed and
+with the obstacle flipped from "to my left" to "to my right" — so it was neither a
+tie-break nor reading the geometry. The cause is coverage, not tuning: neither
+training JSONL contains a single occurrence of "warehouse", "storage rack",
+"dock", "lidar", "aisle" or "blocked", and the head's only spatial-choice
+training is Breakout paddle control — whose gold rule is the **opposite sign**
+(move *toward* the ball; sidestep *away from* the blocker).
+
+Prose-tuning could not fix it, which is worth recording because the two earlier
+Breakout fixes (`8fc3dd5`, `ebfc76c`) were exactly that and did work — there the
+prose *was* the head's training domain. Here, swapping the noun, changing the
+letter case, or appending one field each flipped the answer; sweeping the gap
+from 1 to 9999 px changed nothing, because a bge embedding is nearly insensitive
+to the value of a number. The fix is a trained head, not a better sentence.
+
+#### `ciel_warehouse_v1` — the warehouse head
+
+`model=ciel_warehouse_v1` selects a head trained on this domain as its own
+dynamic-head sub-path (`warehouse`) beside `doc` and `typed`, off the same bge-m3
+backbone. Its corpus is synthetic and template-rendered — `states/warehouse.py` in
+the decision_lab checkout, alongside `states/breakout.py` — so the gold is exact by
+construction and no LLM is involved. The rules it follows are Breakout's: gold
+comes from geometry, distractors are decorrelated from the gold, and templates with
+no direction words at all exist to force a geometry→direction mapping rather than a
+lexical shortcut.
+
+The Model dropdown exposes all three sub-paths plus the laya arms, and that is the
+comparison this page is for: the same demo, one select apart, with a running
+`agrees with geometry N/M` readout under every decision. The options are labelled
+by what they were trained on, because the difference is not a preference —
+`warehouse` is trained on this problem and the others are not, which is what the
+50% below is measuring. `ciel_typed_v1` reaches the `typed` head; it was served by
+the service but missing from `MODEL_PATHS` for a while, which made it unreachable
+*silently* — a request that omits `path` resolves to the service default and only
+an unknown path 400s, so nothing reports the omission. `test_ciel.py` now asserts
+every mapped model is one the server actually routes.
+
+The state is **JSON now, not prose**, and that is the point: the corpus renders the
+same flat JSON the browser sends, so training and inference share one format. Both
+prior incidents in this project were train-here/infer-there mismatches, so the
+format is the contract rather than something to keep tuning. Two constraints follow
+and are pinned by `test_warehouse_sim.mjs`:
+
+- **Flat and scalar only.** `server.py` `str()`s each top-level value, so a nested
+  object would go upstream as a Python `repr` the head has never seen.
+- **At most 15 leaves.** The head prepends the whole text as field 0, and the
+  chunker merges leaves only above `max_fields` — so staying under it keeps the
+  decisive leaf (`obstacle_side`, or `gap_left`/`gap_right` for a rack) standing
+  alone instead of blended into a neighbour's text.
+
+#### The geometry gate was removed, and what that costs
+
+The demo used to run a confidence gate: below `CONF_FLOOR` (0.9) the geometry oracle
+decided instead of the model, and a `decided · deferred` counter showed how often
+that happened. It is gone. Two findings retired it, and the second is the reason it
+is recorded here rather than quietly deleted.
+
+**Its safety half could not fire.** The gate also deferred any answer outside the
+feasible set, on the principle that a confident impossible answer is still
+impossible. But the model cannot produce one: `ciel.py` sends the criteria keys as
+the options and the service argmaxes over them, and `buildQuestion`'s criteria equal
+`feasibleOptions` — measured identical across **359,713 blocking cases**. So the
+model never has an out-of-menu answer to give. An unreachable safety check is not a
+safety check; it is a second home for a rule the ontology now owns, which is exactly
+the arrangement that produced today's standoff.
+
+**Removing it costs what it used to hide.** The gate was compensating for models that
+cannot do this task, so without it those models are plainly wrong. Measured, same
+service, 50 scenarios each:
+
+| model | accuracy vs geometry | predicted | confidence p50 |
+| --- | --- | --- | --- |
+| `ciel_warehouse_v1` | **50/50 (100%)** | left 25 · right 25 | 0.998 |
+| `ciel_decision_model_v1` | 25/50 (50%) | **left 50** — collapsed | 0.568 |
+
+That is the honest reading: the demo now shows an incompetent model *being*
+incompetent instead of being silently rescued. On the `avoid_direction` question
+specifically the doc head agreed with geometry 13 times in 84 decisions — it answers
+`stay` to nearly everything, because most of its training golds are `stay`.
+
+Worth recording that progress is *not* by itself evidence of correctness. The doc
+head still produced 14 deliveries in a browser run — fewer than the working head, but
+not zero — and the first snapshot of that run happened to show `(agrees)`, which
+would have been a false confirmation if only a snapshot had been read. The per-model
+table above is the measurement; the live `geometry says … (agrees|differs)` readout
+next to every decision is there so the same mistake is visible rather than inferred.
+
+#### Escalation is a stall timer, not a blocked timer
+
+The old trigger (5 s continuously blocked) could not fire: across the 178 recorded
+calls the longest block was **3 s**, so the 2-way branch was unreachable and `stay`
+was always on the menu. `STALL_MS` keys on *progress staleness* instead — no forward
+movement — which is the condition the demo actually cares about and holds for rack
+blocks too.
+
+Re-derive the oracle numbers with `node eval_warehouse.mjs --model ciel_warehouse_v1`;
+that per-side accuracy and confusion table is the evidence for the head, and the
+`--model ciel_decision_model_v1` run is the before picture.
+
+#### The option set is a declared rule, not a ternary
+
+The rule that removes "wait" from the menu is stated as axioms, not as the
+hand-written predicate it used to be. `static/warehouse_ontology.js` is the third
+TBox/ABox domain beside `ontology.js` (fleet) and `breakout_ontology.js`, sharing
+the domain-free editor in `ontology_core.js`:
+
+```
+StaticBlocker  ⊥ Stay          a rack never yields, so waiting it out is provably wrong
+StalledBlocker ⊥ Stay          once waiting has demonstrably failed it is not an answer
+StaticBlocker  ⊥ MobileBlocker  a blocker is one kind or the other
+BlockedRobot ⊑ ≥1 goldAction   a blocked robot has an action that clears it
+BlockedRobot ⊑ ≥1 permittedAction   …and at least one legal move
+```
+
+Two things about this are worth stating plainly.
+
+**The axiom form is constrained by the subset, and that shaped the declaration.**
+`ontology_core.js` implements `maxCardinality` / `minCardinality` / `range` /
+`disjoint` — no negation and no implication — so "a static blocker implies `stay`
+is not permitted" cannot be written directly. It is written as a disjointness
+instead, which is the same claim once `Stay` is a class: the permitted-action set
+of a `StaticBlocker` does not contain it.
+`checkTBox` rejects any axiom whose form nothing implements, so a declared rule
+cannot silently go unconsulted.
+
+**The declaration is only worth having because it is checked against the code.**
+`divergence()` runs both the ontology and `feasibleOptions` over every blocking
+situation the simulator produces — 20,000 cases across ten seeds — and
+`test_warehouse_ontology.mjs` asserts zero disagreements. Without that check this
+would be a *second* home for the rule, which is strictly worse than one. That is
+not hypothetical here: the two halves of this rule (which options are offered, and
+which answer is correct) lived in separate functions, drifted, and pinned robots
+in a permanent head-on standoff — 791 deferred against 40 decided.
+
+This is also the one claim the domain *can* keep, and it is weaker than the other
+two demos'. On fleet, turning the ontology on must not change any decision, and
+that holds by construction. Here it cannot: removing an option **is** the change,
+by design. So the note in the panel says so instead of claiming otherwise. The
+demo routes its option set through the ontology, so the panel shows the rule
+actually in force — a rack block reads `permitted left/right`.
+
+#### A rule that reads well and measures badly
+
+The dock is where contention actually is — **54.4% of all blocked ticks** in a 60 s
+run are spent inside a 90 px radius of the cargo house (185,889 of 341,911 across
+seven seeds) — and "a docking station serves one vehicle" is a real domain
+constraint that states cleanly what the fleet demo's seat limit states. So
+`warehouse_sim.js` implements it: Tier 0, occupancy relative (whoever is inside
+keeps it, everyone else heading in holds), no priority function needed because only
+one robot can be the incumbent.
+
+**It measured as a net loss and ships off.** Seven to nine seeds, 60 s each, the
+geometry oracle as the policy, the rule as the only difference:
+
+| | mean deliveries |
+| --- | --- |
+| rule off | **93.6** and **91.1** (two consecutive runs) |
+| rule on | 55.0 and 48.0 |
+
+Roughly 40% of throughput, at every radius swept (20/30/45/60/90 px; best case 46.1
+at 45 px). It also failed to hold its own invariant — 1,800–2,800 ticks of two
+occupants — because the hold parks a robot at the zone edge, where it still counts
+as outside by its own test and still blocks the apron. Serialising the apron costs
+more than the overlap it prevents: the zone is a bottleneck precisely because the
+routes cross in it, so discarding the parallel crossing hurts more than the overlap
+helps.
+
+This is recorded rather than deleted because the negative result is the useful part,
+and because a later attempt should not start from zero. What it would take: a radius
+small enough to exclude the crossing apron (or a zone shaped as a segment of the
+final approach rather than a disc), a hold position genuinely outside the zone *and*
+off the routes others use, and most likely a reservation model rather than a mutex —
+the win would be ordering arrivals, not excluding them. All of that is a bigger
+change than the rule, and none of it is measured yet.
+
+`test_warehouse_sim.mjs` pins the negative result: one test asserts the rule is off
+by default (so a silent flip cannot regress the demo with nothing to explain it),
+another checks the implementation still holds one occupant when deliberately
+enabled with `dockRule: true`.
+
+**Measured, closed-loop** (`node eval_warehouse.mjs`, service on the warehouse
+sub-path, 60 scenarios):
+
+| arm | accuracy vs geometry | prediction distribution | confidence p10 / p50 |
+| --- | --- | --- | --- |
+| `ciel_warehouse_v1` | **60/60 (100%)** | left 30 · right 30 | 0.995 / 0.998 |
+| `ciel_decision_model_v1` (before) | 20/40 (50%) | **left 40** — collapsed | 0.522 / 0.568 |
+
+The before arm is worth reading carefully: under the JSON state it collapsed to
+`left` rather than the `right` from the prose era, i.e. a different constant, still
+uncorrelated with geometry, still exactly chance. That is the shape of an
+out-of-domain answer, and it is why the fix had to be a trained head rather than
+another round of prose.
+
+**Measured, in-distribution** (`python -m decision_lab eval` on the warehouse
+config's `test_warehouse` split, 200 subsampled states, `results/report.md`):
+
+| question | per-label accuracy | confusion |
+| --- | --- | --- |
+| `avoid_direction` | left / right / stay **100%** each | clean diagonal (34 / 29 / 36) |
+| `sidestep_direction` | left / right **100%** each | clean diagonal (83 / 81) |
+
+Mean 65.8% is the average over both questions plus the derived predicates, not a
+per-question figure — the two choice questions are exact. The doc/breakout arm was
+re-measured on the same run as the regression gate: task in-dist 0.9067 against the
+0.924 baseline and breakout paddle 0.965 against 0.976, both inside the repository's
+stated ±2pp gate and its ~3pp seed variance.
+
+The 3-way robot branch is not sampled by the closed-loop run (see the limitation
+below), so it was probed directly against the service instead and is correct in all
+three cases: blocker right → `left` (0.997), blocker left → `right` (0.985),
+head-on → `stay` (1.000).
+
+**In the browser**, with `ciel_warehouse_v1` selected: decisions vary across all three
+actions at ~100% confidence, `blockedNow` repeatedly returns to 0, and deliveries
+accumulate — the partial gridlock the demo used to stall in is gone. Every decision's
+`geometry says … (agrees|differs)` readout reads `agrees`, which is now a measurement
+rather than a claim about a gate that might have covered for the model.
+
+**One limitation to know when reading the oracle.** The harness drives the sim, and
+it does not feed answers back into it — so the scenarios it samples are the ones the
+sim reaches *unopposed*, which under-samples genuinely deadlocked multi-robot blocks
+(a robot that is never told to wait never stalls). In the one run recorded so far,
+40/40 sampled scenarios were rack blocks and the 2-way question; the 3-way robot
+branch is exercised by the demo, not yet by the harness. Feeding decisions back into
+`eval_warehouse.mjs` is the obvious next step, and until then its accuracy is a
+statement about the rack branch.
+
 
 ### laya dispatches the bus fleet
 

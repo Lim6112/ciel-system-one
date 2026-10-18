@@ -31,10 +31,68 @@ SCORE_QUESTION = {
 NOUL_QUESTION = {"type": "noul", "instructions": "Is this actionable?"}
 
 
-def test_state_to_custom_text_joins_bare_values_in_order():
-    # No key prefixes, no newlines: both measurably break the head against the
-    # live service (see ciel.py module docstring).
-    assert ciel._state_to_custom_text({"b": 2, "a": 1}) == "2 1"
+def test_state_to_custom_text_serializes_json():
+    """The state goes upstream as JSON — the same string the head trained on.
+
+    This replaced a bare space-joined-values encoding. Both the old rule and
+    this one exist for the same reason: the head was trained on one format and
+    asked about another, and every documented failure of this adapter has been
+    exactly that. The current corpus (decision_lab states/warehouse.py) renders
+    flat JSON whose keys are the field names, so the keys are signal now.
+    """
+    assert ciel._state_to_custom_text({"b": 2, "a": 1}) == '{"b": 2, "a": 1}'
+
+
+def test_state_to_custom_text_keeps_key_order():
+    """Key order is load-bearing: it decides the leaf order the field splitter
+    produces, and the head attends over that set."""
+    assert ciel._state_to_custom_text({"role": "robot", "color": "red"}) == (
+        '{"role": "robot", "color": "red"}')
+
+
+def test_state_to_custom_text_is_flat_json():
+    """Flat and scalar only: server.py str()s each top-level value, so a nested
+    object would be sent as a Python repr the head has never seen."""
+    text = ciel._state_to_custom_text({"n": 3, "s": "x"})
+    parsed = json.loads(text)
+    assert all(isinstance(v, (str, int, float, bool)) for v in parsed.values())
+
+
+def test_resolve_path_defaults_to_none():
+    """No mapping and no env var => None, i.e. the service's own default head.
+    This is what every caller got before sub-paths existed."""
+    assert ciel.resolve_path(None) is None
+    assert ciel.resolve_path("ciel_decision_model_v1") is None
+
+
+def test_resolve_path_maps_the_warehouse_model():
+    assert ciel.resolve_path("ciel_warehouse_v1") == "warehouse"
+
+
+def test_resolve_path_maps_the_typed_model():
+    """`typed` was served by the service but missing from MODEL_PATHS, which made
+    it unreachable and did so silently — a request with no path resolves to the
+    service default, and only an *unknown* path is a 400."""
+    assert ciel.resolve_path("ciel_typed_v1") == "typed"
+
+
+def test_every_mapped_model_is_routed_by_the_server():
+    """A model in MODEL_PATHS that the server does not route to ciel would fall
+    through to the local laya router and answer with the wrong engine."""
+    import server as cjet_server
+
+    for model in ciel.MODEL_PATHS:
+        assert model in cjet_server.ModelOverride.__args__, (
+            f"{model} maps to a sub-path but the server does not accept it"
+        )
+
+
+def test_resolve_path_honors_env(monkeypatch):
+    monkeypatch.setenv("DECISION_LAB_PATH", "warehouse")
+    assert ciel.resolve_path(None) == "warehouse"
+    # an explicit model mapping still wins over the env default
+    monkeypatch.setenv("DECISION_LAB_PATH", "typed")
+    assert ciel.resolve_path("ciel_warehouse_v1") == "warehouse"
 
 
 def test_to_lab_questions_maps_each_type():
@@ -166,12 +224,28 @@ def test_predict_round_trip(lab_server):
     assert ciel.health() is True
     result = ciel.predict({"body": "hello"}, {"urgency": SCORE_QUESTION})
     assert _LabHandler.received == {
-        "custom_text": "hello",
+        "custom_text": '{"body": "hello"}',
         "questions": [{"type": "score", "question": "urgency",
                        "levels": ["low", "medium", "high"]}],
     }
     assert result["model"] == "ciel_decision_model_v1"
     assert result["answers"]["urgency"]["probabilities"] == {"0": 0.2, "1": 0.6, "2": 0.2}
+
+
+def test_predict_sends_the_sub_path(lab_server):
+    """A problem-specific head is only reachable if the path goes upstream.
+    Without it the service resolves to web.default_path — silently, since an
+    unknown path 400s but a missing one does not."""
+    ciel.predict({"body": "hello"}, {"urgency": SCORE_QUESTION},
+                 model="ciel_warehouse_v1")
+    assert _LabHandler.received["path"] == "warehouse"
+
+
+def test_predict_omits_path_when_unset(lab_server):
+    """No mapping => no path key at all, so existing callers keep hitting the
+    service's default head."""
+    ciel.predict({"body": "hello"}, {"urgency": SCORE_QUESTION})
+    assert "path" not in _LabHandler.received
 
 
 def test_predict_reports_an_unreachable_service(monkeypatch):

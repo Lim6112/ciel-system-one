@@ -85,8 +85,9 @@
 <header>
   <h1>CJet runs the warehouse 🚚</h1>
   <p>Three delivery robots fetch cargo from a random rack and haul it to the dock, weaving through
-     the rack aisles. Forward lidar → when a robot is blocked it asks CJet
-     <code>move: choice(left/stay/right)</code> — left/right sidestep around the obstacle, stay waits.
+     the rack aisles. Forward lidar → when a robot is blocked it asks CJet about the blocker:
+     a <strong>storage rack</strong> gets a 2-way sidestep (a rack never yields, so "wait" is not
+     offered), another <strong>robot</strong> gets the 3-way avoid question.
      Autoplay off = robots just stop (watch the deadlock). <a href="/">← back to the main UI</a></p>
 </header>
 <main>
@@ -113,11 +114,13 @@
           <label for="autoplay">CJet dispatch <span style="color:var(--muted)">(off = blocked robots stop forever)</span></label></span>
         <span class="ctl"><label>Model</label>
           <select id="model">
-            <option value="auto">auto</option>
-            <option value="english">english</option>
-            <option value="typed-decisions">typed-decisions</option>
-            <option value="jev">jev (OpenRouter — slow, costs money)</option>
-            <option value="ciel_decision_model_v1">ciel_decision_model_v1 (local dynamic head)</option>
+            <option value="ciel_warehouse_v1" selected>ciel_warehouse_v1 — trained on this problem</option>
+            <option value="ciel_decision_model_v1">ciel_decision_model_v1 — no warehouse training</option>
+            <option value="ciel_typed_v1">ciel_typed_v1 — typed-decisions head, no warehouse training</option>
+            <option value="auto">auto — laya, no warehouse training</option>
+            <option value="english">english — laya, no warehouse training</option>
+            <option value="typed-decisions">typed-decisions — laya, no warehouse training</option>
+            <option value="jev">jev — OpenRouter, slow, costs money</option>
           </select></span>
         <span class="ctl"><label>Decide every</label>
           <input type="range" id="interval" min="200" max="500" step="50" value="300">
@@ -143,297 +146,87 @@
       <h2>CJet's decisions</h2>
       <div id="decisionBars"></div>
       <div class="meta" id="decisionMeta">no decisions yet</div>
+      <div class="meta" id="agreement">—</div>
       <div id="history"></div>
+    </div>
+    <div class="panel">
+      <h2>Ontology — which actions are permitted</h2>
+      <p class="meta" style="margin-top:0">
+        The declared rule behind the option set. Removing an axiom stops it being
+        enforced, and the panel says so rather than failing.
+      </p>
+      <div id="ontologyPanel"></div>
     </div>
   </section>
 </main>
 
-<script>
+<script type="module">
 "use strict";
 
-// ---- fixed geometry ---------------------------------------------------------
+// Geometry, routes, lidar, physics and the question set live in
+// warehouse_sim.js — a pure, DOM-free module that eval_warehouse.mjs imports
+// too, so the browser and the harness cannot drift apart. This file is only the
+// DOM layer over it.
+import * as S from "./warehouse_sim.js";
+import { mountWarehousePanel, permittedFor } from "./warehouse_panel.js";
 
-const W = 520, H = 420;
-const HOUSE = { x: 205, y: 28, w: 110, h: 62 };          // cargo house building
-const DOCK = { x: HOUSE.x + HOUSE.w / 2, y: HOUSE.y + HOUSE.h };  // delivery point
-// two rows of storage racks; the 50 px gaps between them are the aisles
-// (x 115–165, 235–285 dock-aligned center, 355–405)
-const RACKS = [
-  { id: "A1", x: 45,  y: 170, w: 70, h: 26 },
-  { id: "A2", x: 165, y: 170, w: 70, h: 26 },
-  { id: "A3", x: 285, y: 170, w: 70, h: 26 },
-  { id: "A4", x: 405, y: 170, w: 70, h: 26 },
-  { id: "B1", x: 45,  y: 280, w: 70, h: 26 },
-  { id: "B2", x: 165, y: 280, w: 70, h: 26 },
-  { id: "B3", x: 285, y: 280, w: 70, h: 26 },
-  { id: "B4", x: 405, y: 280, w: 70, h: 26 },
-];
-const PX_PER_M = 10;
-const ROBOT_R = 9;
-const MIN_SEP = 2 * ROBOT_R + 3;                          // hard collision safety
-const LIDAR_HALF_ANGLE = 45 * Math.PI / 180;
-const SIDESTEP_MS = 1500;
+// ---- sim state --------------------------------------------------------------
 
-const fmtM = px => `${Math.max(1, Math.round(px / PX_PER_M))} m`;
+const W = S.W, H = S.H;
+let robots = [], running = false, paused = false;
+let lastTime = 0;
 
-// ---- routes -----------------------------------------------------------------
+// The most recent blocking scene, for the ontology panel's ABox row. Replaced each
+// time a robot asks; the panel reads whatever is current.
+let lastScene = null;
 
-// Robot colors + spawn points only — every destination is assigned at runtime
-const ROUTES = {
-  R1: { color: "#f87171", start: { x: 55, y: 390 } },
-  R2: { color: "#4ade80", start: { x: 465, y: 390 } },
-  R3: { color: "#60a5fa", start: { x: 260, y: 405 } },
-};
-
-// ---- navigation ---------------------------------------------------------------
-// Robots move only along safe lines: corridors are clear horizontally, aisle
-// gaps are clear vertically. Any route is a corridor/aisle L-shaped chain.
-
-const AISLE_XS = [140, 260, 380];       // gap centers between racks
-const CORRIDOR_YS = [146, 238, 330];    // above row A, between rows, below row B
-
-function nearestAisle(x) {
-  return AISLE_XS.reduce((a, b) => Math.abs(b - x) < Math.abs(a - x) ? b : a);
-}
-
-function nearestCorridor(y) {
-  return CORRIDOR_YS.reduce((a, b) => Math.abs(b - y) < Math.abs(a - y) ? b : a);
-}
-
-// row A is approached from the top corridor, row B from the bottom corridor —
-// no route ever needs to cross a rack row horizontally
-function rackCorridor(rack) {
-  return rack.y < 200 ? CORRIDOR_YS[0] : CORRIDOR_YS[2];
-}
-
-// drop consecutive duplicate points and a start point equal to current position
-function cleanPath(pts, from) {
-  const all = [from, ...pts];
-  return all.filter((p, i) =>
-    i > 0 && (Math.abs(p.x - all[i - 1].x) > 0.5 || Math.abs(p.y - all[i - 1].y) > 0.5));
-}
-
-function routeToRack(robot, rack) {
-  const pickX = rack.x + rack.w / 2;
-  const cy = nearestCorridor(robot.y), ty = rackCorridor(rack);
-  const a0 = nearestAisle(robot.x), a1 = nearestAisle(pickX);
-  const pts = [{ x: robot.x, y: cy }, { x: a0, y: cy }];
-  if (a0 !== a1) pts.push({ x: a1, y: cy });
-  if (cy !== ty) pts.push({ x: a1, y: ty });
-  pts.push({ x: pickX, y: ty });
-  return cleanPath(pts, robot);
-}
-
-function routeToDock(robot) {
-  const cy = nearestCorridor(robot.y), ty = CORRIDOR_YS[0];
-  const a = nearestAisle(robot.x);
-  const pts = [{ x: robot.x, y: cy }, { x: a, y: cy }];
-  if (cy !== ty) pts.push({ x: a, y: ty });
-  pts.push({ x: DOCK.x, y: ty }, DOCK);
-  return cleanPath(pts, robot);
-}
-
-// ---- robots -------------------------------------------------------------------
-
-function makeRobot(rid) {
-  const spec = ROUTES[rid];
-  const robot = {
-    id: rid, color: spec.color,
-    x: spec.start.x, y: spec.start.y,
-    waypoints: [], wp: 0,
-    phase: "toPickup", pickupRack: null,   // toPickup -> toDock -> loop
-    heading: 0, waiting: false,
-    sidestepUntil: 0, sidestepDir: 0,
-    blockedSince: null, obstacle: null,
-    deliveries: 0, asking: false, lastAsk: 0,
-  };
-  assignTask(robot);
-  return robot;
-}
-
-// new delivery cycle: pick a random rack, plan the pickup leg
-function assignTask(robot) {
-  robot.pickupRack = RACKS[Math.floor(Math.random() * RACKS.length)];
-  robot.waypoints = routeToRack(robot, robot.pickupRack);
-  robot.wp = 0;
-  robot.phase = "toPickup";
-}
-
-// ---- simulation state -------------------------------------------------------
+// Running agreement between the model and the geometry oracle, reset per run.
+// Shown so the Model dropdown is a comparison rather than a preference.
+let agreement = { calls: 0, hits: 0 };
 
 const canvas = document.getElementById("sim");
 const ctx = canvas.getContext("2d");
 
-let robots = [], running = false, paused = false;
-let lastTime = 0;
-
 function speed() { return Number(document.getElementById("speed").value); }
 function lidarRange() { return Number(document.getElementById("lidar").value); }
-function distanceToDock(r) { return Math.hypot(r.x - DOCK.x, r.y - DOCK.y); }
-
-// ---- lidar ------------------------------------------------------------------
-
-// Vector to another robot in my frame: x = lateral (+right), y = forward (+ahead)
-function relativeTo(observer, other) {
-  const dx = other.x - observer.x, dy = other.y - observer.y;
-  const cos = Math.cos(observer.heading), sin = Math.sin(observer.heading);
-  return {
-    y: dx * cos + dy * sin,       // forward component
-    x: -dx * sin + dy * cos,      // lateral component, +right
-  };
-}
-
-// Straight ray along the heading vs rack rects (slab method). Racks use a ray,
-// not the 45° cone: a robot aimed through a 50 px aisle must not read the
-// flanking rack corners (~25 px lateral, ~30 px ahead) as a wall ahead.
-function rayHitsRack(robot, range) {
-  let best = null;
-  const dirX = Math.cos(robot.heading), dirY = Math.sin(robot.heading);
-  for (const rack of RACKS) {
-    let tmin = 0, tmax = range, hit = true;
-    for (const axis of ["x", "y"]) {
-      const o = axis === "x" ? robot.x : robot.y;
-      const d = axis === "x" ? dirX : dirY;
-      const lo = rack[axis], hi = lo + (axis === "x" ? rack.w : rack.h);
-      if (Math.abs(d) < 1e-6) {
-        if (o < lo || o > hi) { hit = false; break; }
-        continue;
-      }
-      let t1 = (lo - o) / d, t2 = (hi - o) / d;
-      if (t1 > t2) [t1, t2] = [t2, t1];
-      tmin = Math.max(tmin, t1);
-      tmax = Math.min(tmax, t2);
-    }
-    if (hit && tmin <= tmax && tmin > 0 && tmin <= range &&
-        (!best || tmin < best.dist)) {
-      best = { rack, dist: tmin };
-    }
-  }
-  return best;
-}
-
-function scanLidar(robot) {
-  const range = lidarRange();
-  let best = null;
-  for (const other of robots) {
-    if (other === robot) continue;
-    const rel = relativeTo(robot, other);
-    const dist = Math.hypot(rel.x, rel.y);
-    if (dist > range) continue;
-    const angle = Math.abs(Math.atan2(rel.x, Math.max(0, rel.y)));
-    if (rel.y < 0 || angle > LIDAR_HALF_ANGLE) continue;
-    if (!best || dist < best.dist) best = { other: other.id, rack: null, dist, rel };
-  }
-  const rackHit = rayHitsRack(robot, range);
-  if (rackHit && (!best || rackHit.dist < best.dist)) {
-    best = { other: null, rack: rackHit.rack, dist: rackHit.dist, rel: null };
-  }
-  return best;
-}
 
 // ---- CJet decision loop ------------------------------------------------------
 
-// Same left/stay/right schema that scored a 100% side-match rate in the
-// Breakout demo — the 4-way keep/wait/sidestep question produced ~uniform
-// probabilities (out of training distribution) and permanent gridlock.
-const QUESTION = {
-  type: "choice",
-  instructions: "You are a warehouse delivery robot. Another robot or a storage rack is blocking your path ahead. In which direction should you move to resolve the blockage?",
-  criteria: {
-    left: "move to my left to get around the obstacle, then merge back to my route",
-    stay: "wait only if I have been blocked for just a few seconds and the obstacle is about to clear my path",
-    right: "move to my right to get around the obstacle, then merge back to my route",
-  },
-};
-
-// Once waiting has demonstrably failed (blocked >= 5 s), the dispatcher stops
-// offering "stay" and asks CJet which way to sidestep — a two-way directional
-// choice, which is the decision type the checkpoints handle most decisively.
-function buildQuestion(robot) {
-  const blockedFor = robot.blockedSince
-    ? (performance.now() - robot.blockedSince) / 1000 : 0;
-  if (blockedFor < 5) return QUESTION;
-  return {
-    type: "choice",
-    instructions: "You are a warehouse delivery robot. Another robot or a storage rack has been blocking your path for a long time and will not clear it on its own. You must get around it now. In which direction should you sidestep?",
-    criteria: {
-      left: "sidestep to my left to pass the obstacle, then merge back to my route",
-      right: "sidestep to my right to pass the obstacle, then merge back to my route",
-    },
-  };
-}
-
-function describeMotion(me, other, who) {
-  const diff = Math.abs(other.heading - me.heading) % (2 * Math.PI);
-  const possessive = who === "you" ? "your" : "my";
-  if (diff < Math.PI / 6 || diff > 11 * Math.PI / 6) return `moving in the same direction as ${who}`;
-  if (diff > 5 * Math.PI / 6 && diff < 7 * Math.PI / 6) return `moving toward ${who}`;
-  return `crossing ${possessive} path`;
-}
-
-function describeOther(me, other, who) {
-  const rel = relativeTo(me, other);
-  const dist = fmtM(Math.hypot(rel.x, rel.y));
-  const fore = rel.y >= 0 ? `${dist} ahead of ${who}` : `${dist} behind ${who}`;
-  const side = rel.x > 12 ? ", to my right" : rel.x < -12 ? ", to my left" : "";
-  return `The ${colorName(other)} robot is ${fore}${side}, ${describeMotion(me, other, who)}.`;
-}
-
-function colorName(r) {
-  return { R1: "red", R2: "green", R3: "blue" }[r.id];
-}
-
-function buildState(robot, scan) {
-  const rack = scan.rack;
-  const obstacle = rack ? null : robots.find(r => r.id === scan.other);
-  const others = robots.filter(r => r !== robot)
-    .map(r => describeOther(robot, r, "me")).join(" ");
-  const blockedFor = robot.blockedSince
-    ? Math.round((performance.now() - robot.blockedSince) / 1000) : 0;
-  // escalate: long waits must push CJet off "wait"
-  const urgency = blockedFor >= 5
-    ? `; I have already been blocked for ${blockedFor} seconds — waiting is no longer acceptable, I must get around the obstacle`
-    : "";
-  // spell out the physical constraint the lidar distance implies
-  const gapAnalysis = scan.dist < 40
-    ? "the obstacle is very close — there is no room to continue forward without contact; I must stop or sidestep"
-    : "there is room to maneuver";
-  const ahead = rack
-    ? `a storage rack (bay ${rack.id}) is directly ahead in your path, ${fmtM(scan.dist)} away`
-    : `your lidar sees the ${colorName(obstacle)} robot directly ahead in your path, ` +
-      `${fmtM(scan.dist)} away, ${describeMotion(robot, obstacle, "you")}`;
-  const lidarLine = rack
-    ? `obstacle ahead: storage rack ${rack.id}, ${fmtM(scan.dist)}, in my lane; ${gapAnalysis}`
-    : `obstacle ahead: ${scan.other} (${colorName(obstacle)}), ` +
-      `${fmtM(scan.dist)}, in my lane; ${gapAnalysis}`;
-  const heading = robot.phase === "toPickup"
-    ? `heading to storage rack ${robot.pickupRack.id} to pick up cargo, then to the dock`
-    : `carrying cargo to the cargo house dock`;
-  return {
-    situation: `You are the ${colorName(robot)} delivery robot ${heading}, ` +
-      `${fmtM(distanceToDock(robot))} away. ${ahead}. ${others}`,
-    lidar: lidarLine,
-    mission: `${robot.deliveries} ${robot.deliveries === 1 ? "delivery" : "deliveries"} completed; ` +
-      `blocked for ${blockedFor} seconds${urgency}`,
-  };
-}
-
-async function askCJet(robot) {
-  const scan = scanLidar(robot);
-  if (!scan) return;
+async function askCJet(robot, scan, now) {
   robot.asking = true;
   robot.lastAsk = performance.now();
-  const state = buildState(robot, scan);
+
+  const stalledFor = robot.lastProgressAt ? (now - robot.lastProgressAt) / 1000 : 0;
+  const stalled = stalledFor * 1000 >= S.STALL_MS;
+  const kind = scan.rack ? "rack" : "robot";
+  const qid = S.questionId(kind, stalled);
+  const question = S.buildQuestion(kind, stalled);
+  const state = S.buildState(robot, scan, now);
+
   document.getElementById("whoAsked").textContent =
-    `Robot ${robot.id} (${colorName(robot)}) asked:`;
-  document.getElementById("stateView").textContent = JSON.stringify(state, null, 2);
+    `Robot ${robot.id} (${robot.colorName}) asked ${qid} — blocked by ${kind}` +
+    (stalled ? ` · stalled ${stalledFor.toFixed(1)} s, "wait" withdrawn` : "");
+  document.getElementById("stateView").textContent =
+    qid + "\n" + JSON.stringify(state, null, 2);
+
+  // The geometry answer, computed before asking: it is the oracle the eval
+  // scores against and the gate's fallback, so it must not read the model.
+  const oracle = S.goldDirection(scan, stalled);
+  // The permitted set comes from the ontology, not from the sim's own predicate.
+  // It is the same set — that equality is what test_warehouse_ontology.mjs checks
+  // over every blocking situation — but routing the demo through the declaration
+  // is what makes the panel an honest display of the rule in force rather than a
+  // readout of a rule kept somewhere else.
+  const feasible = permittedFor(robot, scan, stalled);
+  lastScene = { robot, scan, stalled };
+
   try {
     const response = await fetch("/api/predict", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         state,
-        questions: { move: buildQuestion(robot) },
+        questions: { [qid]: question },
         model: document.getElementById("model").value,
       }),
     });
@@ -443,12 +236,27 @@ async function askCJet(robot) {
       showError(`Prediction failed (${response.status}): ${detail}`);
       return;
     }
-    applyDecision(robot, scan, body);
+    applyDecision(robot, scan, body, { qid, oracle, feasible }, now);
   } catch (err) {
     showError("Prediction failed: " + err.message);
   } finally {
     robot.asking = false;
   }
+}
+
+
+function applyDecision(robot, scan, body, meta, now) {
+  const answer = body.result.answers[meta.qid];
+  // The model can only answer from the option set it was sent — `ciel.py` passes
+  // the criteria keys as the options and the service argmaxes over them — so the
+  // action is legal by construction and there is nothing to second-guess. The set
+  // itself is owned by the ontology, which is what makes it legal.
+  const action = answer.choice;
+  const confidence = answer.confidence || 0;
+
+  S.applyDecision(robot, action, now);
+  renderDecision(robot, action, answer.probabilities || {}, confidence,
+                 body.latency_ms, scan, meta);
 }
 
 // bar order follows whichever question was asked (2- or 3-way)
@@ -457,29 +265,7 @@ function barsFor(probs) {
   return known.filter(label => label in probs);
 }
 
-function applyDecision(robot, scan, body) {
-  const answer = body.result.answers.move;
-  const action = answer.choice;
-  // "stay" = wait; "left"/"right" = sidestep maneuver
-  // a sidestep already in progress finishes before a "stay" takes hold —
-  // cancelling it mid-maneuver would freeze the robot beside the obstacle
-  const sidestepping = performance.now() < robot.sidestepUntil;
-  if (action === "stay") {
-    if (!sidestepping) robot.waiting = true;
-  } else {
-    robot.waiting = false;
-    // commit to one direction per maneuver — flipping mid-sidestep every
-    // decision tick would zigzag with zero net progress
-    if (!sidestepping) {
-      robot.sidestepUntil = performance.now() + SIDESTEP_MS;
-      robot.sidestepDir = action === "left" ? -1 : 1;
-    }
-  }
-
-  renderDecision(robot, action, answer.probabilities || {}, answer.confidence, body.latency_ms, scan);
-}
-
-function renderDecision(robot, action, probs, confidence, latency, scan) {
+function renderDecision(robot, action, probs, confidence, latency, scan, meta) {
   const bars = document.getElementById("decisionBars");
   bars.innerHTML = "";
   for (const label of barsFor(probs)) {
@@ -493,13 +279,34 @@ function renderDecision(robot, action, probs, confidence, latency, scan) {
       `<div class="bar-label">${pct}%${label === action ? " ← CJet" : ""}</div>`;
     bars.appendChild(row);
   }
+  // The geometry answer is shown next to the model's so a disagreement is visible
+  // — which is how the head's repair was confirmed (the old head disagreed on
+  // every rack) and how a regression would show up. It is a readout, not a gate.
   document.getElementById("decisionMeta").textContent =
-    `robot ${robot.id} · confidence ${confidence} · latency ${latency} ms`;
+    `robot ${robot.id} · ${meta.qid} · confidence ${confidence} · latency ${latency} ms` +
+    ` · geometry says ${meta.oracle}` +
+    (meta.oracle === action ? " (agrees)" : " (differs)");
+
+  // A running agreement rate, so switching the Model dropdown shows a number
+  // rather than an impression. This is the comparison the dropdown exists for:
+  // the trained head and the untrained ones are the same demo except for one
+  // select, and the difference should be legible without reading a README.
+  //
+  // Agreement, not throughput, because deliveries are slow and noisy — the doc
+  // head still completes some deliveries by luck, and a first glance at a
+  // delivery counter would understate how wrong it is.
+  agreement.calls++;
+  if (meta.oracle === action) agreement.hits++;
+  const pct = (100 * agreement.hits / agreement.calls).toFixed(0);
+  document.getElementById("agreement").textContent =
+    `${document.getElementById("model").selectedOptions[0].text} · ` +
+    `agrees with geometry ${agreement.hits}/${agreement.calls} (${pct}%)`;
 
   const history = document.getElementById("history");
   const entry = document.createElement("div");
-  entry.innerHTML = `<span class="act act-${action}">${robot.id} → ${action.replace("_", " ")}</span>` +
-    ` (${((probs[action] || 0) * 100).toFixed(0)}%) · gap ${fmtM(scan.dist)} · ` +
+  entry.innerHTML =
+    `<span class="act act-${action}">${robot.id} → ${action.replace("_", " ")}</span>` +
+    ` (${((probs[action] || 0) * 100).toFixed(0)}%) · gap ${S.fmtM(scan.dist)} · ` +
     `${new Date().toLocaleTimeString()}`;
   history.prepend(entry);
   while (history.children.length > 12) history.lastChild.remove();
@@ -513,32 +320,23 @@ function showError(message) {
 
 function decideTick() {
   if (!running || paused) return;
+  if (!document.getElementById("autoplay").checked) return;
   const now = performance.now();
   const interval = Number(document.getElementById("interval").value);
-  if (!document.getElementById("autoplay").checked) return;
   for (const robot of robots) {
     if (robot.asking || now - robot.lastAsk < interval) continue;
-    const scan = scanLidar(robot);
-    if (scan) askCJet(robot);
+    const scan = S.scanLidar(robot, robots, lidarRange());
+    if (scan) askCJet(robot, scan, now);
   }
 }
 
 // ---- physics -----------------------------------------------------------------
 
-// circle vs rack rect: clamp the circle center to the rect, then distance test
-function hitsRack(x, y) {
-  return RACKS.some(rack => {
-    const cx = Math.max(rack.x, Math.min(x, rack.x + rack.w));
-    const cy = Math.max(rack.y, Math.min(y, rack.y + rack.h));
-    return Math.hypot(x - cx, y - cy) < ROBOT_R;
-  });
-}
-
 function step(dt, now) {
   if (!running || paused) return;
   const blocked = [];
   for (const robot of robots) {
-    const scan = scanLidar(robot);
+    const scan = S.scanLidar(robot, robots, lidarRange());
     robot.obstacle = scan;
     if (scan) {
       if (robot.blockedSince === null) robot.blockedSince = now;
@@ -555,51 +353,10 @@ function step(dt, now) {
     robots.reduce((n, r) => n + r.deliveries, 0);
   updateChips();
 
-  for (const robot of robots) {
-    let vx = 0, vy = 0;
-    if (now < robot.sidestepUntil) {
-      // perpendicular crawl to get around the obstacle
-      const px = Math.cos(robot.heading), py = Math.sin(robot.heading);
-      vx = -py * robot.sidestepDir * speed();
-      vy = px * robot.sidestepDir * speed();
-    } else if (!robot.waiting) {
-      const target = robot.waypoints[robot.wp];
-      const dx = target.x - robot.x, dy = target.y - robot.y;
-      const dist = Math.hypot(dx, dy);
-      if (dist < 5) {
-        robot.wp++;
-        if (robot.wp >= robot.waypoints.length) {
-          // pickup point reached -> haul to the dock; dock reached -> delivered,
-          // then a fresh random rack starts the next cycle
-          if (robot.phase === "toPickup") {
-            robot.phase = "toDock";
-            robot.waypoints = routeToDock(robot);
-          } else {
-            robot.deliveries++;
-            assignTask(robot);
-          }
-          robot.wp = 0;
-        }
-        continue;
-      }
-      robot.heading = Math.atan2(dy, dx);
-      vx = dx / dist * speed();
-      vy = dy / dist * speed();
-    }
-
-    // hard safety: never overlap another robot, whatever CJet decided. If the
-    // direct move is blocked, slide along at increasing angles — otherwise two
-    // robots approaching head-on can push-lock outside each other's lidar cone.
-    let moved = false;
-    for (const off of [0, 0.6, -0.6, 1.2, -1.2, Math.PI / 2, -Math.PI / 2]) {
-      const sx = vx * Math.cos(off) - vy * Math.sin(off);
-      const sy = vx * Math.sin(off) + vy * Math.cos(off);
-      const nx = robot.x + sx * dt, ny = robot.y + sy * dt;
-      const collides = robots.some(o => o !== robot &&
-        Math.hypot(nx - o.x, ny - o.y) < MIN_SEP) || hitsRack(nx, ny);
-      if (!collides) { robot.x = nx; robot.y = ny; moved = true; break; }
-    }
-  }
+  S.step(robots, dt, now, {
+    speed: speed(), lidarRange: lidarRange(),
+    autoplay: document.getElementById("autoplay").checked,
+  });
 }
 
 function updateChips() {
@@ -607,7 +364,7 @@ function updateChips() {
     const chip = document.getElementById(`chip-${robot.id}`);
     if (robot.obstacle) {
       const what = robot.obstacle.rack ? `rack ${robot.obstacle.rack.id}` : robot.obstacle.other;
-      chip.textContent = `${robot.id} · blocked by ${what} (${fmtM(robot.obstacle.dist)})`;
+      chip.textContent = `${robot.id} · blocked by ${what} (${S.fmtM(robot.obstacle.dist)})`;
       chip.className = "chip blocked";
     } else {
       const task = robot.phase === "toPickup"
@@ -640,7 +397,7 @@ function draw() {
   }
 
   // storage racks
-  for (const rack of RACKS) {
+  for (const rack of S.RACKS) {
     ctx.fillStyle = "#4b5563";
     ctx.fillRect(rack.x, rack.y, rack.w, rack.h);
     ctx.strokeStyle = "#6b7280";
@@ -669,14 +426,15 @@ function draw() {
   }
 
   // cargo house
+  const house = S.HOUSE;
   ctx.fillStyle = "#374151";
-  ctx.fillRect(HOUSE.x, HOUSE.y, HOUSE.w, HOUSE.h);
+  ctx.fillRect(house.x, house.y, house.w, house.h);
   ctx.fillStyle = "#9ca3af";
-  ctx.fillRect(HOUSE.x + HOUSE.w / 2 - 18, HOUSE.y + HOUSE.h - 6, 36, 6);
+  ctx.fillRect(house.x + house.w / 2 - 18, house.y + house.h - 6, 36, 6);
   ctx.fillStyle = "#d1d5db";
   ctx.font = "10px sans-serif";
   ctx.textAlign = "center";
-  ctx.fillText("CARGO HOUSE", HOUSE.x + HOUSE.w / 2, HOUSE.y + HOUSE.h / 2 + 3);
+  ctx.fillText("CARGO HOUSE", house.x + house.w / 2, house.y + house.h / 2 + 3);
 
   // robots + lidar cones
   for (const robot of robots) {
@@ -685,24 +443,24 @@ function draw() {
       ctx.beginPath();
       ctx.moveTo(robot.x, robot.y);
       ctx.arc(robot.x, robot.y, lidarRange(),
-        robot.heading - LIDAR_HALF_ANGLE, robot.heading + LIDAR_HALF_ANGLE);
+        robot.heading - S.LIDAR_HALF_ANGLE, robot.heading + S.LIDAR_HALF_ANGLE);
       ctx.closePath();
       ctx.fill();
     }
     ctx.fillStyle = robot.color;
     ctx.beginPath();
-    ctx.arc(robot.x, robot.y, ROBOT_R, 0, Math.PI * 2);
+    ctx.arc(robot.x, robot.y, S.ROBOT_R, 0, Math.PI * 2);
     ctx.fill();
     ctx.strokeStyle = "#111827";
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(robot.x, robot.y);
-    ctx.lineTo(robot.x + Math.cos(robot.heading) * ROBOT_R,
-               robot.y + Math.sin(robot.heading) * ROBOT_R);
+    ctx.lineTo(robot.x + Math.cos(robot.heading) * S.ROBOT_R,
+               robot.y + Math.sin(robot.heading) * S.ROBOT_R);
     ctx.stroke();
     ctx.fillStyle = "#e5e7eb";
     ctx.font = "9px sans-serif";
-    ctx.fillText(robot.id, robot.x, robot.y - ROBOT_R - 3);
+    ctx.fillText(robot.id, robot.x, robot.y - S.ROBOT_R - 3);
   }
 
   if (!running) {
@@ -720,7 +478,7 @@ function draw() {
 function frame(t) {
   const dt = Math.min((t - lastTime) / 1000, 0.033);
   lastTime = t;
-  step(dt, performance.now());
+  if (running && !paused) step(dt, performance.now());
   draw();
   requestAnimationFrame(frame);
 }
@@ -728,10 +486,8 @@ function frame(t) {
 // ---- wiring -------------------------------------------------------------------
 
 function startSim() {
-  robots = [makeRobot("R1"), makeRobot("R2"), makeRobot("R3")];
-  // stagger the ask phases so the three robots don't decide simultaneously
-  // with near-identical state (symmetric answers → symmetric deadlock)
-  robots.forEach((r, i) => { r.lastAsk = i * 120; });
+  // A fresh world each run; the module seeds its own RNG from this.
+  robots = S.createWorld(Math.floor(Math.random() * 1e9));
   running = true; paused = false;
   document.getElementById("pauseBtn").textContent = "Pause";
   document.getElementById("history").innerHTML = "";
@@ -739,6 +495,10 @@ function startSim() {
   document.getElementById("decisionMeta").textContent = "no decisions yet";
   document.getElementById("whoAsked").textContent = "";
   document.getElementById("stateView").textContent = "waiting for the first blocked robot…";
+  // Reset the comparison too, so switching Model and pressing Start gives a clean
+  // read rather than averaging the previous model's run into this one.
+  agreement = { calls: 0, hits: 0 };
+  document.getElementById("agreement").textContent = "—";
   showError("");
   updateAutoplayBadge();
 }
@@ -766,6 +526,22 @@ document.getElementById("lidar").addEventListener("input", function () {
 
 setInterval(decideTick, 100);   // cheap poll; per-robot lastAsk enforces the real interval
 
+// The ontology panel. It reads the live scene, so a blocked robot's permitted set
+// is shown as the ontology computes it — and editing the TBox changes what the
+// panel reports, including reporting an axiom as unasserted once it is removed.
+const ontologyRoot = document.getElementById("ontologyPanel");
+if (ontologyRoot) {
+  // mountTBoxEditor paints into `root` itself and returns nothing, so the repaint
+  // is just a re-mount — which is also what its own onChange does.
+  const repaintOntology = () => mountWarehousePanel({
+    root: ontologyRoot,
+    getSim: () => lastScene,
+    onChange: () => repaintOntology(),
+  });
+  repaintOntology();
+  setInterval(repaintOntology, 500);
+}
+
 // debug/inspection hook: current robot states
 window.__simState = () => robots.map(r => ({
   id: r.id, x: Math.round(r.x), y: Math.round(r.y), phase: r.phase,
@@ -773,6 +549,11 @@ window.__simState = () => robots.map(r => ({
   waiting: r.waiting, sidestep: performance.now() < r.sidestepUntil,
   headingDeg: Math.round(r.heading * 180 / Math.PI), deliveries: r.deliveries,
 }));
+// The confidence floor that used to override the model is gone: the option set is
+// owned by the ontology, so an action the model returns is legal by construction,
+// and second-guessing it with a geometry oracle was a second home for the same
+// rule. The oracle is still computed and displayed next to the model's answer, as
+// a readout rather than a gate.
 
 requestAnimationFrame(frame);
 </script>
