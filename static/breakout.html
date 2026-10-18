@@ -139,11 +139,13 @@
           <label for="autoplay">CJet autoplay <span style="color:var(--muted)">(off = arrow keys)</span></label></span>
         <span class="ctl"><label>Model</label>
           <select id="model">
-            <option value="auto">auto</option>
-            <option value="english">english</option>
-            <option value="typed-decisions">typed-decisions</option>
-            <option value="jev">jev (OpenRouter — slow, costs money)</option>
-            <option value="ciel_decision_model_v1">ciel_decision_model_v1 (local dynamic head)</option>
+            <option value="ciel_decision_model_v1" selected>ciel_decision_model_v1 — trained on this problem</option>
+            <option value="ciel_typed_v1">ciel_typed_v1 — typed-decisions head, no breakout training</option>
+            <option value="ciel_warehouse_v1">ciel_warehouse_v1 — warehouse head, no breakout training</option>
+            <option value="auto">auto — laya, no breakout training</option>
+            <option value="english">english — laya, no breakout training</option>
+            <option value="typed-decisions">typed-decisions — laya, no breakout training</option>
+            <option value="jev">jev — OpenRouter, slow, costs money</option>
           </select></span>
         <span class="ctl"><label>Decide every</label>
           <input type="range" id="interval" min="150" max="500" step="50" value="250">
