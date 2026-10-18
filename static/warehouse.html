@@ -132,7 +132,7 @@
           <input type="range" id="lidar" min="50" max="150" step="10" value="90">
           <label id="lidarLabel">90 px</label></span>
         <span class="ctl"><label>Sidestep</label>
-          <input type="range" id="sidestep" min="100" max="1000" step="20" value="1000">
+          <input type="range" id="sidestep" min="10" max="1000" step="10" value="1000">
           <label id="sidestepLabel">unbounded</label></span>
       </div>
       <p class="meta" style="margin:8px 0 0">
@@ -142,6 +142,12 @@
         trying: the swerve is roughly as large as all forward progress, and nothing
         has yet measured better than unbounded — six attempts are recorded in
         <code>warehouse_sim.js</code>.
+        <br>
+        Below <strong>21 px</strong> (two robot radii plus the safety margin) a robot
+        cannot clear another robot at all, so the low end does not shorten the
+        manoeuvre — it makes each one fail and start again, and you will see the
+        swerving get worse rather than better. That end of the range is there to make
+        the failure visible, not because it is worth using.
       </p>
     </div>
   </section>
