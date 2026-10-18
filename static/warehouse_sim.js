@@ -71,12 +71,12 @@ export const LIDAR_HALF_ANGLE = 20 * Math.PI / 180;
 export const LIDAR_ANGLE_MIN = 5 * Math.PI / 180;         // narrowest the slider allows
 export const LIDAR_ANGLE_MAX = 90 * Math.PI / 180;        // widest; >90 would see behind
 
-// Lidar RANGE in pixels: how far the cone reaches. 90 was the demo's value; 70 is
-// set by request. Range and angle interact, and the interaction is the reason to
-// keep both sliders rather than one: a narrow cone at long range still sees an
-// approaching robot in time, while a narrow cone at 70 px sees the same robot
-// roughly one third of a second before contact at demo speed.
-export const LIDAR_RANGE_DEFAULT = 70;
+// Lidar RANGE in pixels: how far the cone reaches. 90 was the demo's value, then 70,
+// and 60 is set by request. Range and angle interact, and the interaction is the
+// reason to keep both sliders rather than one: a narrow cone at long range still sees
+// an approaching robot in time, while a narrow cone at 60 px sees the same robot
+// roughly a quarter of a second before contact at demo speed.
+export const LIDAR_RANGE_DEFAULT = 60;
 export const LIDAR_RANGE_MIN = 50;
 export const LIDAR_RANGE_MAX = 150;
 // 1500 ms, i.e. ~119 px at demo speed, and MEASURED AS SPENT IN FULL: every

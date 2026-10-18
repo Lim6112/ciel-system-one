@@ -129,8 +129,8 @@
           <input type="range" id="speed" min="40" max="140" step="10" value="80">
           <label id="speedLabel">80 px/s</label></span>
         <span class="ctl"><label>Lidar range</label>
-          <input type="range" id="lidar" min="50" max="150" step="10" value="70">
-          <label id="lidarLabel">70 px</label></span>
+          <input type="range" id="lidar" min="50" max="150" step="10" value="60">
+          <label id="lidarLabel">60 px</label></span>
         <span class="ctl"><label>Lidar angle</label>
           <input type="range" id="lidarAngle" min="5" max="90" step="5" value="20">
           <label id="lidarAngleLabel">20°</label></span>
@@ -174,7 +174,7 @@
         swerving get worse rather than better.
         <br><br>
         <strong>Lidar range</strong> is how far the cone reaches and <strong>lidar
-        angle</strong> is its half-width, defaulting to 70 px and 20°. Together they
+        angle</strong> is its half-width, defaulting to 60 px and 20°. Together they
         set how early a robot notices a crossing counterpart, and the angle is the one
         that matters here: it is the difference between a robot that yields and one
         that simply stops.
@@ -188,7 +188,7 @@
         960 s run. At 20° and above they do not occur. That is why this slider's low end
         is interesting to watch and not worth using.
         <br>
-        The other direction is a real trade. The 20° / 70 px default roughly
+        The other direction is a real trade. The 20° / 60 px default roughly
         <em>doubles</em> throughput against 45° / 90 px, because a robot that never
         sees the other one coming never stops for it — the traffic it avoids avoiding
         is avoidance, not collisions, and physical overlap stays at zero either way.
@@ -196,7 +196,7 @@
         45° / 90 px, so drag both back there to reproduce them.
         <br>
         Range and angle are separate knobs on purpose: a narrow cone at long range
-        still sees an approaching robot in time, whereas a narrow cone at 70 px sees
+        still sees an approaching robot in time, whereas a narrow cone at 60 px sees
         the same robot well under half a second before contact.
         <br><br>
         The angle affects robot-vs-robot detection only: a rack is found by a straight
