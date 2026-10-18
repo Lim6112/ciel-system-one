@@ -30,6 +30,7 @@ import {
   inDockZone,
   nearestCorridor,
   questionId,
+  rejoinPath,
   scanLidar,
   step,
 } from "./static/warehouse_sim.js";
@@ -548,6 +549,89 @@ test("a head-on pair is sent to opposite sides of the corridor", () => {
       `heading ${deg}deg: the pair converged (${before.toFixed(2)} -> ${after.toFixed(2)}) — ` +
       `named "${stA.obstacle_side}"/"${stB.obstacle_side}"`);
   }
+});
+
+test("rejoining a path keeps the goal and drops only what is behind", () => {
+  // A sidestep ends and the robot has to get back on its route. Asking the ROUTER
+  // for a new one is wrong — it rebuilds the chain from the current position and
+  // resets `wp`, so its first leg is "go to the nearest corridor" and a robot that
+  // just stepped off that corridor is sent sideways back onto the line it left.
+  // Measured with the router route: 3,585 deliveries became 2,759.
+  //
+  // `rejoinPath` projects instead: find the segment nearest the robot and resume
+  // from its near end, keeping the rest untouched.
+  const robot = {
+    id: "R1", x: 300, y: 200, heading: 0, wp: 1,
+    // An L-chain: along the corridor at y=238, then up the aisle at x=260.
+    waypoints: [{ x: 260, y: 330 }, { x: 260, y: 238 }, { x: 140, y: 238 }, { x: 140, y: 146 }],
+  };
+  const goalBefore = robot.waypoints[robot.waypoints.length - 1];
+  assert.equal(rejoinPath(robot), true);
+  // The goal must not move — a rejoin corrects the return leg, it does not re-plan.
+  const goalAfter = robot.waypoints[robot.waypoints.length - 1];
+  assert.deepEqual(goalAfter, goalBefore, "the goal was re-decided");
+  assert.equal(robot.wp, 0);
+  // And nothing behind the robot is kept: it is at y=200 on the x=260 segment, so
+  // the earlier waypoints are already passed.
+  assert.ok(!robot.waypoints.some(p => p.x === 260 && p.y === 330),
+    `a passed waypoint came back: ${JSON.stringify(robot.waypoints)}`);
+});
+
+test("a rejoin never leaves the robot with no path", () => {
+  // An empty waypoint list is read as "arrived" by the step loop, which would fire
+  // a phase change from a swerve rather than from reaching the goal.
+  const robot = { id: "R1", x: 140, y: 146, heading: 0, wp: 0,
+                  waypoints: [{ x: 140, y: 146 }] };
+  const had = JSON.stringify(robot.waypoints);
+  const ok = rejoinPath(robot);
+  if (ok) assert.ok(robot.waypoints.length > 0, "rejoin emptied the path");
+  else assert.equal(JSON.stringify(robot.waypoints), had, "refused but mutated anyway");
+});
+
+test("rejoining beats re-routing measured end to end", () => {
+  // The property the feature exists for, measured rather than asserted. Compared
+  // against the same run with rejoining off, so the difference is the feature.
+  const measure = replan => {
+    let deliveries = 0, over4s = 0;
+    for (const seed of [1, 5]) {
+      const robots = createWorld(seed);
+      const lastAsk = new Map();
+      const open = new Map();
+      let now = 0;
+      for (let i = 0; i < 60000; i++) {
+        now += 16;
+        step(robots, 0.016, now, { ...CONFIG, replanAfterSidestep: replan });
+        for (const robot of robots) {
+          const scan = robot.obstacle;
+          const byRobot = scan && !scan.rack;
+          const cur = open.get(robot.id);
+          if (cur && (!byRobot || cur.blocker !== scan.other)) {
+            if (now - cur.start > 4000) over4s++;
+            open.delete(robot.id);
+          }
+          if (byRobot && !open.has(robot.id)) open.set(robot.id, { start: now, blocker: scan.other });
+          if (!scan || now - (lastAsk.get(robot.id) || 0) < 300) continue;
+          lastAsk.set(robot.id, now);
+          const stalledFor = robot.lastProgressAt ? (now - robot.lastProgressAt) / 1000 : 0;
+          const stalled = stalledFor * 1000 >= STALL_MS;
+          const kind = scan.rack ? "rack" : "robot";
+          const role = kind === "robot" ? headOnRole(robot, scan) : null;
+          const options = feasibleOptions(kind, stalled, role);
+          let gold = goldDirection(scan, stalled, role);
+          if (!options.includes(gold)) gold = options[0];
+          applyDecision(robot, gold, now);
+        }
+      }
+      deliveries += robots.reduce((n, r) => n + r.deliveries, 0);
+    }
+    return { deliveries, over4s };
+  };
+  const off = measure(false);
+  const on = measure(true);
+  assert.ok(on.deliveries >= off.deliveries,
+    `rejoining reduced deliveries: ${off.deliveries} -> ${on.deliveries}`);
+  assert.ok(on.over4s <= off.over4s,
+    `rejoining increased the >4s tail: ${off.over4s} -> ${on.over4s}`);
 });
 
 test("createWorld is deterministic for a given seed", () => {

@@ -541,7 +541,78 @@ export function headOnRole(robot, scan) {
   return robot.id < scan.other ? "advance" : "yield";
 }
 
-// ---- physics ----------------------------------------------------------------
+// Rejoin the route after a sidestep, by PROJECTING onto the path already planned
+// rather than re-deriving one.
+//
+// WHY NOT JUST CALL THE ROUTER AGAIN. `routeToRack`/`routeToDock` build their
+// L-chain from the robot's current position and reset `wp = 0`, and their first leg
+// is always "go to `nearestCorridor(robot.y)`". A robot that has just stepped
+// sideways off its corridor is already AT that corridor, so that first leg is pure
+// sideways backtracking back onto the line it deliberately left — and because it
+// resets `wp`, the robot also re-walks legs it had already completed. Measured:
+// 3,585 deliveries became 2,759 and sidestep travel per delivery went 475 px to
+// 662 px. The router is right for planning from rest and wrong for rejoining.
+//
+// What re-joining needs is the part of the OLD chain the robot has not yet passed.
+// The old chain is a sequence of axis-aligned segments along corridors and aisles,
+// so "where has the robot got to" is answerable without the router: find the
+// segment nearest the robot's current position and keep everything from its far end
+// onward, then head for the near end of that segment first to get back onto the
+// line. The goal is unchanged, so nothing is re-decided — only the rejoining leg.
+//
+// `from` is a robot-like object with x/y; returning the input unchanged means the
+// re-plan found nothing better, and the caller keeps its existing path.
+export function rejoinPath(robot) {
+  const pts = robot.waypoints;
+  if (!pts || pts.length === 0) return false;
+  const here = { x: robot.x, y: robot.y };
+
+  // Everything already behind the robot is finished; `wp` is the index of the
+  // segment it is currently travelling, so start there.
+  let best = -1, bestDist = Infinity;
+  for (let i = Math.max(0, robot.wp - 1); i < pts.length; i++) {
+    const p = pts[i];
+    // Distance to the segment p -> pts[i+1] (or to p itself for the last point).
+    const q = pts[i + 1] || p;
+    const dx = q.x - p.x, dy = q.y - p.y;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 === 0 ? 0 : Math.max(0, Math.min(1,
+      ((here.x - p.x) * dx + (here.y - p.y) * dy) / len2));
+    const cx = p.x + dx * t, cy = p.y + dy * t;
+    const d = Math.hypot(here.x - cx, here.y - cy);
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  if (best < 0) return false;
+
+  // Rejoin at the near end of the segment the robot is on, then keep the rest of
+  // the chain exactly as planned. Naming the NEAR end is what pulls the robot back
+  // onto its line with the shortest correction; keeping the tail means nothing
+  // ahead of it is re-decided, so the goal and the route beyond the swerve are
+  // untouched.
+  //
+  // The rejoining point is dropped if the robot is already essentially on it, which
+  // is the common case (a sidestep of a few pixels clears the lane): then the
+  // planned path is simply resumed and no correction leg exists at all.
+  const p = pts[best];
+  const q = pts[best + 1];
+  const candidates = q ? [p, q] : [p];
+  candidates.sort((m, n) =>
+    Math.hypot(here.x - m.x, here.y - m.y) - Math.hypot(here.x - n.x, here.y - n.y));
+  const rejoin = candidates[0];
+  const alreadyThere = Math.hypot(here.x - rejoin.x, here.y - rejoin.y) < 2;
+  const keepIdx = pts.indexOf(rejoin);
+  const tail = pts.slice(keepIdx + (alreadyThere ? 1 : 0));
+  const next = alreadyThere ? tail : [rejoin, ...tail];
+  // Never leave the robot with no waypoints. An empty path is read as "arrived" by
+  // the step loop, which would fire a phase change from a swerve rather than from
+  // reaching the goal — so a re-plan that empties the path is refused and the
+  // caller keeps what it had.
+  if (next.length === 0) return false;
+  robot.waypoints = next;
+  robot.wp = 0;
+  return true;
+}
+
 
 // circle vs rack rect: clamp the circle center to the rect, then distance test
 export function hitsRack(x, y) {
@@ -679,7 +750,8 @@ export function dockZoneOpen(robot, robots, radius = DOCK_ZONE_RADIUS, reserved 
 }
 
 export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = false,
-                                       dockZoneRadius = DOCK_ZONE_RADIUS }) {
+                                       dockZoneRadius = DOCK_ZONE_RADIUS,
+                                       replanAfterSidestep = true }) {
   bindWorld(robots);
   const blocked = [];
   for (const robot of robots) {
@@ -732,6 +804,14 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
 
     const held = !dockVerdict.get(robot.id);
     robot.heldByDock = held;
+
+    // A sidestep that has finished rejoins the plan by PROJECTION, not by asking
+    // the router for a new one — see `rejoinPath` for why re-routing backtracks.
+    // Gated so the difference is measurable rather than assumed.
+    if (replanAfterSidestep && robot.wasSidestepping && now >= robot.sidestepUntil) {
+      rejoinPath(robot);
+    }
+    robot.wasSidestepping = now < robot.sidestepUntil;
 
     // The head-on election, recomputed from the ABox each tick like the dock
     // verdict — so it is never stale and lifts by itself once the encounter ends.
