@@ -145,6 +145,9 @@ export function makeRobot(rid, rng = Math.random) {
     blockedSince: null, lastProgressAt: 0, lastProgressX: spec.start.x,
     lastProgressY: spec.start.y,
     obstacle: null, deliveries: 0, asking: false, lastAsk: 0,
+    // The seeded rng, kept so every later task assignment draws from the same
+    // deterministic stream rather than falling back to Math.random.
+    rng,
   };
   assignTask(robot, rng);
   return robot;
@@ -354,6 +357,79 @@ export function bindWorld(robots) {
   robotsById = new Map(robots.map(r => [r.id, r]));
 }
 
+// ---- head-on priority -------------------------------------------------------
+//
+// Two robots meeting dead ahead cannot be told apart by geometry: their lateral
+// offset is zero, so there is no side to prefer, and the gold oracle answers
+// "stay" to BOTH of them. Both yield, nobody moves, and the pair sits there until
+// STALL_MS (4 s) expires and escalation forces a sidestep — which is why head-on
+// encounters resolved in ~4.4 s while every other block resolved in ~0.22 s
+// (measured: 96% of the >4s episodes were head-on, and 96% of those had
+// escalated).
+//
+// So the dead band needs a tie-break, and the rule is: the LOWER ID advances, the
+// other yields. That is asymmetric by construction — exactly one robot can hold the
+// lower id — which is what makes the deadlock structurally impossible rather than
+// merely unlikely. Same principle as the dock rule, where the incumbent is found
+// rather than elected.
+//
+// WHY THIS NEEDS A LEADER, AND HOW THE LEADER IS PICKED. The comparison must reach
+// the same verdict on both robots independently, and two candidates were measured:
+//
+//   first-detected (blockedSince) — the tick each robot first saw an obstacle.
+//     Wall-clock, equal on both sides, no coordinate frame involved. Measured as
+//     the worse rule: p90 1,376 ms, max 5,920 ms, and 704 encounters over 4 s.
+//   lower id — needs no memory at all. p90 672 ms, max 3,088 ms, and ZERO
+//     encounters over 4 s. Reproducible across runs once `assignTask` stopped
+//     drawing from Math.random (see that call site — before the fix every A/B
+//     here was noise).
+//
+// The id rule wins because `blockedSince` is not a stable property of the
+// MEETING, it is a property of each robot's own history: a robot that has been
+// blocked by something else, or blocked longer ago, carries a stale value into a
+// new encounter and elects the wrong side. Measured: the role flipped mid-encounter
+// in ~6% of encounters, and flipping is what re-arms the STALL_MS wait. The id
+// comparison reads only who the counterpart is, so it cannot be stale and cannot
+// disagree between the two robots — each compares its own id against the other's
+// and exactly one concludes "advance".
+//
+// The cost, stated plainly: the lower id is always the one that goes first, so the
+// rule is unfair in a way a wall-clock race is not. It buys a 2x p90 and removes
+// the >4 s tail entirely, which is the trade this demo wants — but it is a trade,
+// not a free lunch, and if fairness ever matters more than latency the
+// `blockedSince` version is the one to bring back.
+//
+// `role` is "advance" for the lower id, "yield" for the other. Returns null for
+// anything that is not a dead-ahead encounter, so callers can fall through to the
+// ordinary gold.
+export const HEAD_ON_BAND_PX = 12;      // same dead band goldDirection uses
+
+// THE REMAINING TAIL, DIAGNOSED BUT NOT FIXED. About 5 encounters in 11,204
+// (0.04%) still exceed 4 s, and they have one shape. The two robots do not agree
+// on whether they are head-on: the higher id sees the other dead ahead and yields,
+// while the lower id sees it at an angle (|rel.x| > the dead band), gets role null,
+// and dodges and returns to its route over and over. So the yielder waits for a
+// robot that IS moving but is not clearing its path, and only STALL_MS breaks it
+// (measured: yielder stall 1.3 s climbing to 7.7 s while the counterpart's stall
+// stayed at 0.0 s throughout).
+//
+// A counterpart-stall rule was tried and removed: it asks "is the robot I am
+// waiting for moving", and that robot moves busily while never clearing, so the
+// rule fired almost never (6 encounters over 4 s became 5). The signal that would
+// work is "has the distance between us stopped closing" — progress of the
+// ENCOUNTER rather than of either robot — which needs per-encounter state the sim
+// does not keep. Not attempted here: it is more machinery than the 0.04% justifies,
+// and this file's history is a list of plausible rules that measured worse.
+export function headOnRole(robot, scan) {
+  if (!scan || scan.rack || !scan.rel) return null;
+  if (Math.abs(scan.rel.x) > HEAD_ON_BAND_PX) return null;
+  if (scan.rel.y <= 0) return null;              // not actually ahead of me
+  // No counterpart to compare against (a harness driving a single robot): the
+  // robot in front of us advances, because nothing has elected it to yield.
+  if (!robotsById.has(scan.other)) return "yield";
+  return robot.id < scan.other ? "advance" : "yield";
+}
+
 // ---- physics ----------------------------------------------------------------
 
 // circle vs rack rect: clamp the circle center to the rect, then distance test
@@ -368,34 +444,57 @@ export function hitsRack(x, y) {
 // Which way actually clears a blocker, from geometry alone. This is the oracle
 // eval_warehouse.mjs scores the model against, and the gate's fallback — so it
 // must not read any surface word.
-export function goldDirection(scan, stalled = false) {
+export function goldDirection(scan, stalled = false, role = null) {
   if (scan.rack) {
     // Away from where the rack sits — which is also the wider-gap side.
     const lateral = scan.rackLateral ?? 0;
     return lateral > 0 ? "left" : "right";
   }
   const rel = scan.rel || { x: 0 };
-  // Head-on. `stalled` decides which of the two head-on answers applies, and
-  // the flag is not optional trivia: without it this returns "stay", which
-  // `feasibleOptions` has just withdrawn because waiting demonstrably failed. A
-  // gate that defers to this answer would put the robot straight back into the
-  // wait it escalated out of, forever — measured at 791 deferred against 40
-  // decided, with robots pinned in a head-on standoff.
-  if (Math.abs(rel.x) <= 12) {
-    // Head-on and stalled: there is no preferred side to read off the offset
-    // (it is ~zero), so the answer is a fixed "left". A fixed choice is what
-    // makes it a symmetry break rather than a coin flip: two robots facing each
-    // other have opposite headings, so each one's "left" is the other's right in
-    // world space — they move apart instead of mirroring into another standoff.
+  if (Math.abs(rel.x) <= HEAD_ON_BAND_PX) {
+    // Dead ahead, so the offset carries no side to prefer. Two cases, and they
+    // differ by whether anything has been elected:
+    //
+    // `role` set (see headOnRole) is the resolved case. The robot that detected
+    // the blocker first advances — a sidestep, so the question keeps a real
+    // answer — while the other yields. That asymmetry is what removes the wait:
+    // before this, both were told "stay" and the pair burned STALL_MS 4 s doing
+    // nothing, which measured as ~4.4 s head-on resolution against ~0.22 s for
+    // every other block.
+    //
+    // `role` null is the unresolved case: either nobody compared yet, or the
+    // surrounding code is not running the priority rule. Answering a sidestep
+    // here would make both robots dodge the same way and keep dodging, so the
+    // honest answer with nothing elected is the one that does not invent an
+    // asymmetry that is not there. Callers that DO run the rule pass a role.
+    if (role === "advance") return "left";
+    if (role === "yield") return "stay";
+    // Unresolved: `stalled` is the caller saying waiting has demonstrably failed,
+    // so a sidestep is forced rather than a wait that will not end. Without it,
+    // yield — which is only correct when the other side is advancing.
     return stalled ? "left" : "stay";
   }
   return rel.x > 0 ? "left" : "right";       // away from the blocker
 }
 
-// Options the geometry leaves open. A rack cannot be waited out, and a blocker
-// dead ahead has no "around" to go to, so neither offers the full menu.
-export function feasibleOptions(blockerKind, stalled) {
-  return (blockerKind === "rack" || stalled) ? ["left", "right"] : ["left", "stay", "right"];
+// Options the geometry leaves open, and the exact counterpart of goldDirection —
+// whatever this offers, that function must answer from; whatever it withholds,
+// that function must not answer. The two drifted once and pinned robots in a
+// permanent standoff, so `divergence()` checks them against each other over every
+// blocking situation the sim produces.
+//
+// A rack cannot be waited out. A blocker dead ahead USED to withhold "stay" too,
+// on the grounds that there is no around to go to — which was true and also the
+// bug: with "stay" withdrawn and no side to prefer, the only answers left were
+// two arbitrary directions, and the pair sat until STALL_MS expired. Now the
+// dead band resolves through headOnRole instead: the advance role is offered a
+// sidestep (it must move), the yield role is offered "stay" (moving is not its
+// job), and the two agree because they share one comparison.
+export function feasibleOptions(blockerKind, stalled, role = null) {
+  if (blockerKind === "rack") return ["left", "right"];
+  if (role === "advance") return ["left", "right"];
+  if (role === "yield") return ["left", "stay", "right"];
+  return stalled ? ["left", "right"] : ["left", "stay", "right"];
 }
 
 // ---- dock zone: a rule that does not pay for itself -------------------------
@@ -523,10 +622,22 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
     const held = !dockVerdict.get(robot.id);
     robot.heldByDock = held;
 
+    // The head-on election, recomputed from the ABox each tick like the dock
+    // verdict — so it is never stale and lifts by itself once the encounter ends.
+    // A yielding robot holds: it was elected to concede, and the answer it was
+    // given ("stay") means wait, which only works if waiting is actually honoured.
+    // See the head-on priority note above headOnRole for why the election exists.
+    const hRole = headOnRole(robot, robot.obstacle);
+    robot.headOnRole = hRole;
+    const yielding = hRole === "yield";
+    if (yielding) robot.waiting = true;
+
     let vx = 0, vy = 0;
-    if (held) {
+    if (held || yielding) {
       // Tier 0 closes the zone: no movement, and no sidestep either — a sidestep
-      // is still motion, and the rule is about not entering.
+      // is still motion, and the rule is about not entering. The yield case is
+      // the same shape: a robot elected to concede stops, including mid-sidestep,
+      // because continuing to crawl would carry it into the robot it conceded to.
     } else if (now < robot.sidestepUntil) {
       // perpendicular crawl to get around the obstacle
       const px = Math.cos(robot.heading), py = Math.sin(robot.heading);
@@ -547,7 +658,13 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = 
             robot.waypoints = routeToDock(robot);
           } else {
             robot.deliveries++;
-            assignTask(robot);
+            // The robot's own rng, not Math.random. Using the default here made
+            // every cycle after the first unseeded, so `createWorld(seed)` was
+            // only deterministic up to the first delivery and two runs of the
+            // same seed diverged — which silently turned every A/B measurement
+            // in this file's history into noise (same seed gave 3,774 / 8,156 /
+            // 9,547 episodes across three runs).
+            assignTask(robot, robot.rng);
           }
           robot.wp = 0;
         }

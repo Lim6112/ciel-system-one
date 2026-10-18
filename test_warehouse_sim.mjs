@@ -17,12 +17,14 @@ import {
   SIDESTEP_QID,
   STALL_MS,
   applyDecision,
+  bindWorld,
   buildQuestion,
   buildState,
   createWorld,
   dockZoneOpen,
   feasibleOptions,
   goldDirection,
+  headOnRole,
   headingIn,
   hitsRack,
   inDockZone,
@@ -363,6 +365,119 @@ test("the dock rule can still be turned on and holds one occupant", () => {
   assert.equal(headingIn(outside), true);
   assert.equal(dockZoneOpen(inside, robots), true, "the incumbent keeps the zone");
   assert.equal(dockZoneOpen(outside, robots), false, "a second arrival is refused");
+});
+
+test("a run stays deterministic past the first delivery", () => {
+  // createWorld seeds the RNG, but `step` used to call `assignTask(robot)` with
+  // no rng, so every task after the first drew from Math.random. `createWorld(seed)`
+  // was therefore only deterministic up to the first delivery, and two runs of the
+  // same seed diverged — which silently turned several A/B measurements taken
+  // during this work into noise (one seed, three runs: 3,774 / 8,156 / 9,547
+  // encounters). Pinned here because a benchmark harness that is not reproducible
+  // is worse than no harness: it produces confident numbers about nothing.
+  const snapshot = seed => {
+    const robots = createWorld(seed);
+    let now = 0;
+    const lastAsk = new Map();
+    for (let i = 0; i < 40000; i++) {
+      now += 16;
+      step(robots, 0.016, now, CONFIG);
+      for (const robot of robots) {
+        const scan = robot.obstacle;
+        if (!scan || now - (lastAsk.get(robot.id) || 0) < 300) continue;
+        lastAsk.set(robot.id, now);
+        const stalledFor = robot.lastProgressAt ? (now - robot.lastProgressAt) / 1000 : 0;
+        const stalled = stalledFor * 1000 >= STALL_MS;
+        const kind = scan.rack ? "rack" : "robot";
+        const role = kind === "robot" ? headOnRole(robot, scan) : null;
+        const options = feasibleOptions(kind, stalled, role);
+        let gold = goldDirection(scan, stalled, role);
+        if (!options.includes(gold)) gold = options[0];
+        applyDecision(robot, gold, now);
+      }
+    }
+    return {
+      deliveries: robots.reduce((n, r) => n + r.deliveries, 0),
+      pos: robots.map(r => `${r.id}(${Math.round(r.x)},${Math.round(r.y)})`),
+      racks: robots.map(r => r.pickupRack.id),
+    };
+  };
+  const a = snapshot(1);
+  const b = snapshot(1);
+  assert.deepEqual(a, b, "same seed diverged — a task assignment is drawing from Math.random");
+  assert.ok(a.deliveries > 3, `only ${a.deliveries} deliveries; not past the first cycle`);
+});
+
+test("a dead-ahead meeting elects exactly one advancer, from both sides", () => {
+  // The tie-break that replaced the blockedSince election. Both robots must reach
+  // a verdict, the verdicts must be opposite, and neither may need shared state:
+  // each compares its own id against the counterpart's.
+  const robots = createWorld(1);
+  // Put two robots nose to nose in the same lane, headings opposed.
+  const [a, b] = [robots[0], robots[1]];
+  a.x = 260; a.y = 330; a.heading = Math.PI; a.waypoints = [{ x: 100, y: 330 }]; a.wp = 0;
+  b.x = 220; b.y = 330; b.heading = 0; b.waypoints = [{ x: 400, y: 330 }]; b.wp = 0;
+  bindWorld(robots);
+  const scanA = scanLidar(a, robots, CONFIG.lidarRange);
+  const scanB = scanLidar(b, robots, CONFIG.lidarRange);
+  assert.ok(scanA && scanB, "the two should see each other");
+  const roleA = headOnRole(a, scanA);
+  const roleB = headOnRole(b, scanB);
+  assert.ok(roleA && roleB, `both must be elected, got ${roleA}/${roleB}`);
+  assert.notEqual(roleA, roleB,
+    `both elected "${roleA}" — a dead-ahead pair would move or hold together`);
+  // And the elected roles are the ones the option sets reflect.
+  assert.deepEqual(feasibleOptions("robot", false, roleA).includes("stay"), roleA === "yield");
+  assert.deepEqual(feasibleOptions("robot", false, roleB).includes("stay"), roleB === "yield");
+});
+
+test("head-on resolutions stay under the stall budget", () => {
+  // The property the election exists for. Before it, head-on meetings waited out
+  // STALL_MS (4 s) and took ~4.4 s to resolve against ~0.22 s for every other
+  // block. Measured after: p90 736 ms, and the >4 s count fell from 704 to 6 over
+  // seven seeds. The bound is loose on purpose — the assertion is that the wait is
+  // not the norm, not that the tail is gone (a 0.04% tail remains, diagnosed in
+  // warehouse_sim.js).
+  const slow = [];
+  let total = 0;
+  for (const seed of [1, 5]) {
+    const robots = createWorld(seed);
+    const lastAsk = new Map();
+    const open = new Map();
+    let now = 0;
+    for (let i = 0; i < 60000; i++) {
+      now += 16;
+      step(robots, 0.016, now, CONFIG);
+      for (const robot of robots) {
+        const scan = robot.obstacle;
+        const byRobot = scan && !scan.rack;
+        const cur = open.get(robot.id);
+        if (cur && (!byRobot || cur.blocker !== scan.other)) {
+          total++;
+          if (now - cur.start > 4000) slow.push(now - cur.start);
+          open.delete(robot.id);
+        }
+        if (byRobot && !open.has(robot.id)) {
+          open.set(robot.id, { start: now, blocker: scan.other });
+        }
+        if (!scan || now - (lastAsk.get(robot.id) || 0) < 300) continue;
+        lastAsk.set(robot.id, now);
+        const stalledFor = robot.lastProgressAt ? (now - robot.lastProgressAt) / 1000 : 0;
+        const stalled = stalledFor * 1000 >= STALL_MS;
+        const kind = scan.rack ? "rack" : "robot";
+        const role = kind === "robot" ? headOnRole(robot, scan) : null;
+        const options = feasibleOptions(kind, stalled, role);
+        let gold = goldDirection(scan, stalled, role);
+        if (!options.includes(gold)) gold = options[0];
+        applyDecision(robot, gold, now);
+      }
+    }
+  }
+  assert.ok(total > 100, `only ${total} robot-vs-robot encounters`);
+  const share = slow.length / total;
+  assert.ok(share < 0.02,
+    `${slow.length}/${total} (${(100 * share).toFixed(2)}%) encounters exceeded the ` +
+    `4 s stall budget — the election is not doing its job`);
 });
 
 test("createWorld is deterministic for a given seed", () => {

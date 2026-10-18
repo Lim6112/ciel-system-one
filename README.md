@@ -368,6 +368,40 @@ below), so it was probed directly against the service instead and is correct in 
 three cases: blocker right → `left` (0.997), blocker left → `right` (0.985),
 head-on → `stay` (1.000).
 
+#### A dead-ahead meeting elects one robot to advance
+
+Two robots meeting nose to nose are the one case geometry cannot decide: their
+lateral offset is zero, so there is no side to prefer, and the oracle answered `stay`
+to both. Both yielded, nobody moved, and the pair sat out `STALL_MS` (4 s) before
+escalation forced a sidestep — measured as ~4.4 s head-on resolution against ~0.22 s
+for every other block, with 96% of the slow encounters being exactly this.
+
+So the dead band has a tie-break: **the lower id advances, the other yields.** Two
+elections were measured, and the first one was worse:
+
+| election | p50 | p90 | max | over 4 s |
+| --- | --- | --- | --- | --- |
+| first-detected (`blockedSince`) | 224 ms | 1,376 ms | 5,920 ms | **704** |
+| lower id | 160 ms | **736 ms** | 9,424 ms | **6** |
+
+First-detected loses because `blockedSince` is a property of each robot's *history*,
+not of the meeting: a stale value carries into a new encounter and elects the wrong
+side, and it flipped the role mid-encounter in ~6% of cases — which re-arms the
+4 s wait each time. The id comparison reads only who the counterpart is, so it cannot
+be stale and cannot disagree between the two robots.
+
+**The cost, stated plainly:** the lower id always goes first, so this is unfair in a
+way a wall-clock race is not. It buys a 2x p90 and removes the 4 s tail almost
+entirely, and if fairness ever matters more than latency the `blockedSince` version is
+the one to bring back. A **0.04% tail remains** (6 encounters in 11,204) and is
+diagnosed in `warehouse_sim.js`: the two robots disagree about whether they are
+head-on, so the higher id yields to a robot that is busily dodging and returning to
+its route without ever clearing the path. A counterpart-stall rule was tried for it
+and removed — it asks "is the robot I am waiting for moving", and that robot moves the
+whole time, so it fired almost never (6 became 5). The signal that would work is
+whether the *distance between them* has stopped closing, which needs per-encounter
+state the sim does not keep and is more machinery than 0.04% justifies.
+
 **In the browser**, with `ciel_warehouse_v1` selected: decisions vary across all three
 actions at ~100% confidence, `blockedNow` repeatedly returns to 0, and deliveries
 accumulate — the partial gridlock the demo used to stall in is gone. Every decision's
