@@ -398,7 +398,78 @@ export function feasibleOptions(blockerKind, stalled) {
   return (blockerKind === "rack" || stalled) ? ["left", "right"] : ["left", "stay", "right"];
 }
 
-export function step(robots, dt, now, { speed, lidarRange, autoplay }) {
+// ---- dock zone: a rule that does not pay for itself -------------------------
+//
+// IMPLEMENTED, MEASURED, SHIPPED OFF. Read this before turning it on.
+//
+// The problem it was meant to solve is real. Every robot's route ends at the
+// cargo house — the one place all three converge — and that is where the
+// contention is: 54.4% of all blocked ticks in a 60 s run are spent inside this
+// radius (185,889 of 341,911 across seven seeds). A docking station serving one
+// vehicle at a time is also a real domain rule, and it says cleanly what the
+// fleet demo's seat limit says: a second arrival is not a bad answer, it is a
+// state the domain does not permit.
+//
+// It does not work, and the reason is worth keeping.
+//
+// WHAT WAS MEASURED. Seven to nine seeds, 60 s each, geometry oracle as the
+// policy, the only difference being this rule:
+//
+//   rule off   93.6 and 91.1 mean deliveries (two consecutive runs)
+//   rule on    55.0 and 48.0
+//
+// So it costs roughly 40% of throughput. The radius was swept (20/30/45/60/90 px)
+// and every value was worse than off, best case 46.1 at 45 px. It also failed to
+// hold its own invariant: 1,800-2,800 ticks of two robots inside the zone, not
+// through a race but because the hold parks a robot AT the zone edge where it
+// still counts as outside on its own test and still blocks the apron.
+// Serialising the apron costs more than the overlap it prevents: the zone is a
+// bottleneck precisely because the routes cross in it, so throwing away the
+// parallel crossing hurts more than the two-robot overlap helps.
+//
+// WHAT WOULD BE NEEDED TO MAKE IT WORK — not done, recorded so the next attempt
+// does not start from zero:
+//   - A radius small enough to exclude the crossing apron, or a zone shaped as a
+//     segment of the final approach rather than a disc around the dock.
+//   - A hold position that is genuinely outside the zone AND off the routes
+//     others use, since the current one parks a blocker in the aisle.
+//   - Most likely a reservation model rather than a mutex: the win would be
+//     ordering arrivals, not excluding them.
+// Any of those is a bigger change than the rule itself, and the evidence above
+// says the rule as stated is a net loss.
+//
+// Kept as code because it is a complete, working implementation of the axiom the
+// ontology would declare (see the plan's F1/F2): if the ontology route is taken,
+// this is what the declared rule would have to govern, and it is measurable in
+// place with `dockRule: true`. Kept OFF because shipping it would make the demo
+// worse, and a rule that reads well and measures badly is exactly the thing the
+// Tier-0 pattern is supposed to catch.
+export const DOCK_ZONE_RADIUS = 45;
+
+export function inDockZone(robot, radius = DOCK_ZONE_RADIUS) {
+  return Math.hypot(robot.x - DOCK.x, robot.y - DOCK.y) < radius;
+}
+
+export function headingIn(robot, radius = DOCK_ZONE_RADIUS) {
+  const target = robot.waypoints[robot.wp];
+  return !!target && Math.hypot(target.x - DOCK.x, target.y - DOCK.y) < radius;
+}
+
+// The axiom's implementation: at most one robot inside the zone. Whoever is
+// already in keeps it; everyone else heading in holds. Occupancy relative, so it
+// is asymmetric by construction and needs no priority function — unlike the
+// head-on standoff fixed elsewhere in this module, which was symmetric and so
+// deadlocked. That part of the reasoning held; the throughput did not.
+export function dockZoneOpen(robot, robots, radius = DOCK_ZONE_RADIUS, reserved = null) {
+  if (inDockZone(robot, radius)) return true;    // already inside: let it out
+  if (!headingIn(robot, radius)) return true;    // not entering the dock
+  const occupied = robots.some(o => o !== robot && inDockZone(o, radius));
+  const claimed = reserved && reserved.size > 0;
+  return !occupied && !claimed;
+}
+
+export function step(robots, dt, now, { speed, lidarRange, autoplay, dockRule = false,
+                                       dockZoneRadius = DOCK_ZONE_RADIUS }) {
   bindWorld(robots);
   const blocked = [];
   for (const robot of robots) {
@@ -416,6 +487,31 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay }) {
     blocked.push(!!scan);
   }
 
+  // The Tier-0 verdict, recomputed from the ABox every tick rather than carried
+  // as state. That matters: `waiting` is cleared each tick for an unblocked
+  // robot, so a hold expressed as "tell it to wait" evaporates immediately and
+  // the robot walks in anyway. Reading occupancy fresh also means the hold lifts
+  // by itself the moment the incumbent leaves, with nothing to reset.
+  //
+  // Two robots can be admitted in the same tick — occupancy is read before either
+  // has moved — and both then finish inside the zone, breaking the very invariant
+  // the rule exists to state (measured: 7,250 ticks of two-occupancy over nine
+  // seeds, before this was fixed). So the scan also claims the zone: the first
+  // admitted robot reserves it and the rest of the tick is refused against the
+  // reservation, not merely against the current occupants.
+  const dockVerdict = new Map();
+  const reserved = new Set();
+  for (const robot of robots) {
+    const open = dockRule
+      ? dockZoneOpen(robot, robots, dockZoneRadius, reserved)
+      : true;
+    dockVerdict.set(robot.id, open);
+    if (open && dockRule && !inDockZone(robot, dockZoneRadius) &&
+        headingIn(robot, dockZoneRadius)) {
+      reserved.add(robot.id);
+    }
+  }
+
   for (const robot of robots) {
     const travelled = Math.hypot(robot.x - robot.lastProgressX, robot.y - robot.lastProgressY);
     if (travelled > PROGRESS_EPSILON_PX) {
@@ -424,8 +520,14 @@ export function step(robots, dt, now, { speed, lidarRange, autoplay }) {
       robot.lastProgressY = robot.y;
     }
 
+    const held = !dockVerdict.get(robot.id);
+    robot.heldByDock = held;
+
     let vx = 0, vy = 0;
-    if (now < robot.sidestepUntil) {
+    if (held) {
+      // Tier 0 closes the zone: no movement, and no sidestep either — a sidestep
+      // is still motion, and the rule is about not entering.
+    } else if (now < robot.sidestepUntil) {
       // perpendicular crawl to get around the obstacle
       const px = Math.cos(robot.heading), py = Math.sin(robot.heading);
       vx = -py * robot.sidestepDir * speed;

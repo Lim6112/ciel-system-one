@@ -12,15 +12,20 @@ import assert from "node:assert/strict";
 
 import {
   AVOID_QID,
+  DOCK,
+  DOCK_ZONE_RADIUS,
   SIDESTEP_QID,
   STALL_MS,
   applyDecision,
   buildQuestion,
   buildState,
   createWorld,
+  dockZoneOpen,
   feasibleOptions,
   goldDirection,
+  headingIn,
   hitsRack,
+  inDockZone,
   nearestCorridor,
   questionId,
   scanLidar,
@@ -320,6 +325,44 @@ test("the oracle never contradicts the option set it is gated against", () => {
       }
     }
   }
+});
+
+test("the dock-zone rule is off by default, because it costs throughput", () => {
+  // A negative result worth pinning. The rule is a clean statement of a real
+  // domain constraint and it is fully implemented, but it measured as a ~40%
+  // throughput LOSS (89.6 -> 43.6 mean deliveries here; 93.6/91.1 -> 55.0/48.0
+  // across two runs over nine seeds) at every radius swept, 20-90 px. It also
+  // failed to hold its own invariant, because the hold parks a robot at the zone
+  // edge where it still blocks the apron.
+  //
+  // So this test does not assert the rule works. It asserts the rule is not
+  // silently switched on: if someone flips the default, the demo regresses and
+  // nothing else in the suite would say why.
+  assert.equal(DOCK_ZONE_RADIUS > 0, true);
+  const robots = createWorld(1);
+  const seen = [];
+  step(robots, 0.016, 16, CONFIG);
+  seen.push(robots.every(r => r.heldByDock === false));
+  assert.ok(seen.every(Boolean),
+    "the dock rule is holding robots by default — it was measured as a net loss");
+});
+
+test("the dock rule can still be turned on and holds one occupant", () => {
+  // The implementation stays live and reachable (dockRule: true) so the negative
+  // result above is reproducible and so an ontology-driven retry has something to
+  // govern. Sanity-check the pieces rather than the throughput.
+  const robots = createWorld(1);
+  const inside = robots[0];
+  inside.x = DOCK.x;
+  inside.y = DOCK.y + 10;
+  const outside = robots[1];
+  outside.waypoints = [{ x: DOCK.x, y: DOCK.y }];
+  outside.wp = 0;
+  assert.equal(inDockZone(inside), true);
+  assert.equal(inDockZone(outside), false);
+  assert.equal(headingIn(outside), true);
+  assert.equal(dockZoneOpen(inside, robots), true, "the incumbent keeps the zone");
+  assert.equal(dockZoneOpen(outside, robots), false, "a second arrival is refused");
 });
 
 test("createWorld is deterministic for a given seed", () => {

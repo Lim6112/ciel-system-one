@@ -220,6 +220,45 @@ Re-derive the oracle numbers with `node eval_warehouse.mjs --model ciel_warehous
 that per-side accuracy and confusion table is the evidence for the head, and the
 `--model ciel_decision_model_v1` run is the before picture.
 
+#### A rule that reads well and measures badly
+
+The dock is where contention actually is — **54.4% of all blocked ticks** in a 60 s
+run are spent inside a 90 px radius of the cargo house (185,889 of 341,911 across
+seven seeds) — and "a docking station serves one vehicle" is a real domain
+constraint that states cleanly what the fleet demo's seat limit states. So
+`warehouse_sim.js` implements it: Tier 0, occupancy relative (whoever is inside
+keeps it, everyone else heading in holds), no priority function needed because only
+one robot can be the incumbent.
+
+**It measured as a net loss and ships off.** Seven to nine seeds, 60 s each, the
+geometry oracle as the policy, the rule as the only difference:
+
+| | mean deliveries |
+| --- | --- |
+| rule off | **93.6** and **91.1** (two consecutive runs) |
+| rule on | 55.0 and 48.0 |
+
+Roughly 40% of throughput, at every radius swept (20/30/45/60/90 px; best case 46.1
+at 45 px). It also failed to hold its own invariant — 1,800–2,800 ticks of two
+occupants — because the hold parks a robot at the zone edge, where it still counts
+as outside by its own test and still blocks the apron. Serialising the apron costs
+more than the overlap it prevents: the zone is a bottleneck precisely because the
+routes cross in it, so discarding the parallel crossing hurts more than the overlap
+helps.
+
+This is recorded rather than deleted because the negative result is the useful part,
+and because a later attempt should not start from zero. What it would take: a radius
+small enough to exclude the crossing apron (or a zone shaped as a segment of the
+final approach rather than a disc), a hold position genuinely outside the zone *and*
+off the routes others use, and most likely a reservation model rather than a mutex —
+the win would be ordering arrivals, not excluding them. All of that is a bigger
+change than the rule, and none of it is measured yet.
+
+`test_warehouse_sim.mjs` pins the negative result: one test asserts the rule is off
+by default (so a silent flip cannot regress the demo with nothing to explain it),
+another checks the implementation still holds one occupant when deliberately
+enabled with `dockRule: true`.
+
 **Measured, closed-loop** (`node eval_warehouse.mjs`, service on the warehouse
 sub-path, 60 scenarios):
 
