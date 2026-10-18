@@ -181,6 +181,17 @@ comes from geometry, distractors are decorrelated from the gold, and templates w
 no direction words at all exist to force a geometry→direction mapping rather than a
 lexical shortcut.
 
+The Model dropdown exposes all three sub-paths plus the laya arms, and that is the
+comparison this page is for: the same demo, one select apart, with a running
+`agrees with geometry N/M` readout under every decision. The options are labelled
+by what they were trained on, because the difference is not a preference —
+`warehouse` is trained on this problem and the others are not, which is what the
+50% below is measuring. `ciel_typed_v1` reaches the `typed` head; it was served by
+the service but missing from `MODEL_PATHS` for a while, which made it unreachable
+*silently* — a request that omits `path` resolves to the service default and only
+an unknown path 400s, so nothing reports the omission. `test_ciel.py` now asserts
+every mapped model is one the server actually routes.
+
 The state is **JSON now, not prose**, and that is the point: the corpus renders the
 same flat JSON the browser sends, so training and inference share one format. Both
 prior incidents in this project were train-here/infer-there mismatches, so the

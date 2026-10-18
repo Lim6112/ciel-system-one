@@ -69,6 +69,24 @@ def test_resolve_path_maps_the_warehouse_model():
     assert ciel.resolve_path("ciel_warehouse_v1") == "warehouse"
 
 
+def test_resolve_path_maps_the_typed_model():
+    """`typed` was served by the service but missing from MODEL_PATHS, which made
+    it unreachable and did so silently — a request with no path resolves to the
+    service default, and only an *unknown* path is a 400."""
+    assert ciel.resolve_path("ciel_typed_v1") == "typed"
+
+
+def test_every_mapped_model_is_routed_by_the_server():
+    """A model in MODEL_PATHS that the server does not route to ciel would fall
+    through to the local laya router and answer with the wrong engine."""
+    import server as cjet_server
+
+    for model in ciel.MODEL_PATHS:
+        assert model in cjet_server.ModelOverride.__args__, (
+            f"{model} maps to a sub-path but the server does not accept it"
+        )
+
+
 def test_resolve_path_honors_env(monkeypatch):
     monkeypatch.setenv("DECISION_LAB_PATH", "warehouse")
     assert ciel.resolve_path(None) == "warehouse"

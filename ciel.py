@@ -46,7 +46,16 @@ DECIDE_PATH = "/api/decide-dynamic"
 PATH_ENV = "DECISION_LAB_PATH"
 
 # Model overrides that select a problem-specific head rather than the doc bank.
-MODEL_PATHS = {"ciel_warehouse_v1": "warehouse"}
+#
+# Every name here must correspond to a key in the service's `web.paths`. `typed`
+# was served but missing from this map for a while, which made it unreachable:
+# a request that omits `path` resolves to the service's default and 400s only on
+# an *unknown* path, never a missing one, so the omission was silent — the exact
+# failure the resolve_path docstring below warns about.
+MODEL_PATHS = {
+    "ciel_warehouse_v1": "warehouse",
+    "ciel_typed_v1": "typed",
+}
 
 
 def resolve_path(model: str | None = None) -> str | None:

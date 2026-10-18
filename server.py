@@ -44,7 +44,7 @@ import decision_lab_proxy
 QuestionType = Literal["choice", "score", "noul"]
 ModelOverride = Literal[
     "auto", "english", "multilingual", "typed-decisions", "jev",
-    "ciel_decision_model_v1", "ciel_warehouse_v1",
+    "ciel_decision_model_v1", "ciel_warehouse_v1", "ciel_typed_v1",
 ]
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -135,7 +135,7 @@ def predict(request: PredictRequest) -> dict[str, Any]:
     # Ciel is also a network call to a separate service (the local decision_lab
     # dynamic head), so it likewise skips predict_lock and never 503s on a cold
     # laya router — it does not need the router, only the service up.
-    if request.model in ("ciel_decision_model_v1", "ciel_warehouse_v1"):
+    if request.model in ("ciel_decision_model_v1", "ciel_warehouse_v1", "ciel_typed_v1"):
         try:
             result = ciel.predict(
                 _stringify_state(request.state), questions, model=request.model
