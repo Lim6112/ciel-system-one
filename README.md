@@ -72,7 +72,16 @@ autofill both the state and the question cards, or enter the state as JSON and
 build questions with the form (type `choice` / `score` / `noul`, instructions,
 and per-option criteria rows). Optionally override the model checkpoint and
 run: results render per question with probability bars and the routing
-metadata (model, repo, reason, latency).
+metadata (model, repo, reason, path, latency).
+
+The Model dropdown offers the **same eight arms** as the demo pages — the three
+laya checkpoints, `auto`, `jev`, and the three `ciel_*` sub-paths — each labelled
+by what it is, because the difference between the last three is not a preference.
+This page is domain-neutral by design, so unlike `warehouse.html` and
+`breakout.html` none of them is marked "trained on this problem": which head fits
+depends on the state you paste. The routing panel reports `path` for that reason —
+a `ciel_*` request with no sub-path silently lands on the service's default
+(doc/breakout) head, so the arm that answered is shown rather than inferred.
 
 - `server.py` — FastAPI app; `POST /api/predict` validates the payload against
   laya's question schema with pydantic (choice → dict criteria, score → list,

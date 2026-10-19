@@ -380,10 +380,33 @@ def test_ciel_branch_returns_laya_shaped_result(client, ciel_stub):
     assert body["result"]["answers"]["assign"]["choice"] == "bus_b"
     assert body["routing"]["model"] == "ciel_decision_model_v1"
     assert body["routing"]["repo"] == "decision_lab/dynamic-head"
+    # No sub-path in MODEL_PATHS, so the service's own default head answers — reported
+    # explicitly rather than left absent, because `index.html` renders this field and a
+    # missing one would read as "no path" instead of "the default path".
+    assert body["routing"]["path"] == "(service default)"
     # The laya router is never touched on this path.
     assert not hasattr(stub, "last_call")
     assert ciel_stub[0]["state"] == {"body": "hi"}
     assert ciel_stub[0]["questions"]["assign"]["criteria"] == VALID_CHOICE["criteria"]
+
+
+def test_ciel_routing_reports_the_sub_path_that_answered(client, ciel_stub):
+    """Each sub-path arm names its own head, so the UI can show which one replied.
+
+    The value the page offers is what `resolve_path` maps; this pins the pairing
+    end to end, so a dropdown option cannot be added that silently lands on the
+    default head while its label claims a trained one.
+    """
+    test_client, _ = client
+    for model, expected in [("ciel_warehouse_v1", "warehouse"),
+                            ("ciel_typed_v1", "typed")]:
+        body = test_client.post("/api/predict", json={
+            "state": {"body": "hi"},
+            "questions": {"assign": VALID_CHOICE},
+            "model": model,
+        }).json()
+        assert body["routing"]["model"] == model
+        assert body["routing"]["path"] == expected
 
 
 def test_ciel_answer_shapes_match_laya(client, ciel_stub):

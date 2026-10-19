@@ -132,12 +132,14 @@
       <div class="row">
         <label style="flex:0; white-space:nowrap;">Model</label>
         <select id="model">
-          <option value="auto">auto</option>
-          <option value="english">english</option>
-          <option value="multilingual">multilingual</option>
-          <option value="typed-decisions">typed-decisions</option>
-          <option value="jev">jev (OpenRouter — slow, costs money)</option>
-          <option value="ciel_decision_model_v1">ciel_decision_model_v1 (local dynamic head)</option>
+          <option value="auto">auto — laya router (language-routed)</option>
+          <option value="english">english — laya checkpoint</option>
+          <option value="multilingual">multilingual — laya checkpoint</option>
+          <option value="typed-decisions">typed-decisions — laya checkpoint</option>
+          <option value="jev">jev — OpenRouter, slow, costs money</option>
+          <option value="ciel_decision_model_v1">ciel_decision_model_v1 — doc/breakout head</option>
+          <option value="ciel_typed_v1">ciel_typed_v1 — typed-decisions head</option>
+          <option value="ciel_warehouse_v1">ciel_warehouse_v1 — warehouse head</option>
         </select>
       </div>
       <div style="margin-top: 12px;">
@@ -817,6 +819,13 @@ function renderResult(body) {
     if (routing.reason) {
       box.appendChild(el("div", {},
         [el("strong", { text: "reason: " }), document.createTextNode(routing.reason)]));
+    }
+    // Which sub-path answered, for the ciel arms. A request with no path silently
+    // lands on the service's default head, so the choice is reported rather than
+    // inferred — `ciel_decision_model_v1` has no mapping and reads "(service default)".
+    if (routing.path) {
+      box.appendChild(el("div", {},
+        [el("strong", { text: "path: " }), document.createTextNode(routing.path)]));
     }
     // Jev reports what the call cost; laya returns nothing because it runs locally.
     if (body.result && body.result.cost_usd) {
