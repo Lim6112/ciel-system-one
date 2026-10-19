@@ -137,6 +137,9 @@ should be and whether the model agreed). An **Ontology** panel shows the declare
 rule that decides which directions are offered. Hard collision prevention is
 independent of laya — physics never lets robots overlap; laya decides strategy.
 Toggle autoplay off to watch blocked robots stop forever: the deadlock laya prevents.
+How that deadlock was diagnosed and solved through the ontology — with the measured
+numbers, the six structural defects it hid, and the two attribution errors along the
+way — is written up in **[ontology_usage.md](ontology_usage.md)** (Korean).
 
 **There are two blockers and they are two different problems**, so the demo asks
 two different questions. A **storage rack** is static and never yields — waiting
@@ -259,7 +262,11 @@ that per-side accuracy and confusion table is the evidence for the head, and the
 The rule that removes "wait" from the menu is stated as axioms, not as the
 hand-written predicate it used to be. `static/warehouse_ontology.js` is the third
 TBox/ABox domain beside `ontology.js` (fleet) and `breakout_ontology.js`, sharing
-the domain-free editor in `ontology_core.js`:
+the domain-free editor in `ontology_core.js`. The full account — the three
+different situations behind "deadlock", why the escape axiom is the one place a
+declaration is the *source* of behaviour rather than a check on it, and the
+measurements that retired two wrong explanations — is in
+**[ontology_usage.md](ontology_usage.md)**:
 
 ```
 StaticBlocker  ⊥ Stay          a rack never yields, so waiting it out is provably wrong

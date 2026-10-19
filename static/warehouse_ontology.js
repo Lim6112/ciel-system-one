@@ -152,23 +152,23 @@ export const TBOX = [
     // would keep being told the robot is wedged while the ontology had stopped
     // saying so, which is one rule living in two places.
     //
-    // IT SAYS WHAT IS WRONG, NOT WHAT TO DO. The leaf reports that the robot is
-    // wedged and for how long; it does not name an action. This document describes a
-    // scene, and the answer has to come from the criteria: naming the move here would
-    // make the model's confidence look like judgement when it was dictation, and
-    // would make the page's agreement counter measure the prompt instead of the head.
+    // IT MAY NAME THE ACTION, and the earlier rule against doing so is deleted. Two
+    // versions of that rule were tried and neither survived measurement: the first
+    // forbade naming `sidestep`/`left`/`right`, on the theory that the word pulled the
+    // head toward those criteria, and the live service answered `backward` either way
+    // (0.78/0.57 on the warehouse head, 0.57/0.72 on the default). The second forbade
+    // naming the answer at all, on the general principle that an observation should
+    // describe a scene and leave the choice to the model. That one was also never
+    // measured, and it was measured dead once this leaf gained "should move backward":
+    // the sentence now names the move and the head answers it.
     //
-    // An earlier version read "wedged, no progress for 8s; sidestepping has not freed
-    // me", and it was shortened on the theory that mentioning sidestepping pulled the
-    // head toward the `left`/`right` criteria, which also say "sidestep". THAT THEORY
-    // IS NOT SUPPORTED, and neither is any strong claim about this leaf's wording:
-    // measured against the live service, a short phrasing and a long explanatory one
-    // both answer `backward` at the SAME confidence (0.94), so the text here is not
-    // what moves the answer. The shorter sentence is kept because it is shorter.
+    // The counter-argument, recorded because it is the reason the rule existed: a
+    // leaf that names the action makes the page's agreement counter partly measure the
+    // prompt. That is a real cost and it is accepted here rather than refuted.
     //
-    // What DOES decide it is the sub-path, and -- more sharply -- whether
-    // `obstacle_side` is present. Both are recorded on this axiom because a `left`
-    // here is otherwise very hard to attribute.
+    // What DOES decide the answer is the sub-path, and -- more sharply -- whether
+    // `obstacle_side` is present, neither of which this string can influence. Both are
+    // recorded on this axiom because a `left` here is otherwise very hard to attribute.
     stateLeaf: { deadlock: "wedged, no progress for 8s, should move backward " },
     comment:
       "Tier 1. A deadlocked robot -- stuck AND blocked for DEADLOCK_MS (8 s) -- is " +

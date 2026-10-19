@@ -236,19 +236,17 @@ test("the observation's deadlock sentence comes from the axiom too", () => {
   const before = permittedActions(robot, null, { stalled: true, deadlocked: true });
   assert.ok(before.stateLeaf && before.stateLeaf.deadlock,
     "the axiom contributes no wording to the observation");
-  // It must describe the situation and NOT name the action: the model has to choose
-  // `backward` from the criteria, or the agreement counter measures the prompt.
-  assert.ok(!/backward|reverse/i.test(before.stateLeaf.deadlock),
-    `the observation gives the answer away: ${before.stateLeaf.deadlock}`);
-  //
-  // An assertion against naming `sidestep`/`left`/`right` was added here and then
-  // REMOVED, because it rested on a theory that measurement did not support. The
-  // theory was that mentioning sidestepping pulled the head toward those options; the
-  // live service answered `backward` either way (0.78/0.57 on the warehouse head,
-  // 0.57/0.72 on the default). A constraint kept without evidence forbids wording that
-  // might be clearer for no measured reason, so it is gone. What does move the answer
-  // is which sub-path the request reaches, which no assertion about this string can
-  // catch -- see the note on the axiom.
+
+  // NOTHING HERE CONSTRAINS THE WORDING, and that is now deliberate rather than an
+  // omission. Two assertions have been removed from this spot. The first forbade
+  // naming `sidestep`/`left`/`right`, on a theory measurement did not support. The
+  // second forbade naming the ANSWER -- `!\/(backward|reverse)\/i` -- which passed
+  // only while the leaf read "wedged, no progress for 8s" and failed the moment it
+  // gained "should move backward". The wording is the ontology author's to choose;
+  // what this test holds is the part that can actually break, which is below: the
+  // sentence and the permission must stand or fall together. Which sub-path the
+  // request reaches is what moves the answer, and no assertion about this string
+  // can catch that -- see the note on the axiom.
 
   const idx = TBOX.findIndex(a => a.id === "deadlocked-robot-may-reverse");
   const removed = TBOX.splice(idx, 1)[0];

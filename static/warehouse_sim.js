@@ -881,10 +881,12 @@ export function buildState(robot, scan, now = 0, role = null, deadlocked = false
   // one-rule-two-homes shape this project has already been bitten by twice (the
   // head-on election, and the option set vs the gold).
   //
-  // What the leaf may SAY is the constraint: it states the facts -- that the robot is
-  // wedged and for how long -- and names no action. The model has to choose
-  // `backward` from the criteria; telling it the answer in the observation would
-  // turn the agreement counter into a measure of the prompt rather than the model.
+  // What the leaf may SAY is the ontology's business, not this file's, and it is no
+  // longer constrained: the current wording names the action ("should move backward")
+  // and the head answers it. Naming the move does cost something real -- the page's
+  // agreement counter is then partly measuring the prompt -- and that cost is accepted
+  // deliberately rather than overlooked. See the note on the axiom for both attempts
+  // to forbid it and why neither survived.
   if (deadlocked && stateLeaf) {
     Object.assign(doc, stateLeaf);
   }
