@@ -8,6 +8,18 @@ dependencies = [
     "laya>=0.3.5",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    # The security-guard example (guard_agent.py) is a LangChain v1 agent whose
+    # middleware wraps the model call, the tool call and the model's output.
+    # langchain-openrouter is the default backend (deepseek/deepseek-v4.1-flash) —
+    # local Ollama was too slow to answer through the guard on every turn. It needs
+    # OPENROUTER_API_KEY; langchain-ollama stays so `GUARD_MODEL=ollama:...` can put
+    # the example back on a local model with no key, and `GUARD_MODEL=openai:...`
+    # switches providers. The `openrouter` SDK it pulls in pins pydantic<2.13, so this
+    # dependency is also what holds pydantic at 2.12.5 — do not read the downgrade as
+    # a resolution accident and "fix" it.
+    "langchain>=1.4.7",
+    "langchain-openrouter>=0.2.9",
+    "langchain-ollama>=1.1.0",
     # Intel Mac (x86_64) support. PyTorch stopped publishing macOS x86_64 wheels after
     # 2.2.2, so 2.2.2 is the newest torch installable here. That version forces two
     # downstream caps. Each is marked on platform_machine so Apple Silicon, where

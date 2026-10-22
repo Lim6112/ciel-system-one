@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CJet — the security guard</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --border: #d9dde3;
+    --text: #1c2128;
+    --muted: #6b7280;
+    --accent: #4f46e5;
+    --accent-soft: #eef2ff;
+    --danger: #b91c1c;
+    --danger-bg: #fef2f2;
+    --ok: #047857;
+    --warn: #b45309;
+    --warn-bg: #fffbeb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { margin: 0; font-size: 17px; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; max-width: 70ch; }
+  main {
+    display: grid; grid-template-columns: minmax(380px, 5fr) minmax(360px, 4fr);
+    gap: 20px; padding: 20px 24px; max-width: 1280px; margin: 0 auto;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 20px;
+  }
+  .panel h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase;
+    letter-spacing: 0.04em; color: var(--muted); }
+  textarea, input[type="text"], select {
+    width: 100%; border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font: inherit; color: var(--text); background: #fff;
+  }
+  textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px; min-height: 90px; resize: vertical; }
+  textarea:focus, input:focus, select:focus { outline: 2px solid var(--accent);
+    outline-offset: -1px; border-color: var(--accent); }
+  button {
+    font: inherit; border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 12px; background: #fff; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary {
+    background: var(--accent); border-color: var(--accent); color: #fff;
+    font-weight: 600; padding: 10px 18px; font-size: 15px;
+  }
+  button.primary:hover { opacity: 0.9; color: #fff; }
+  button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.ghost { border: none; background: none; color: var(--accent); padding: 2px 6px; }
+  button.ghost:hover { text-decoration: underline; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row + .row { margin-top: 10px; }
+  label.ctl { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .field { flex: 1; }
+  .muted { color: var(--muted); }
+  .meta { color: var(--muted); font-size: 12px; }
+
+  .examples { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  /* The transcript. */
+  .turn { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+  .turn.blocked { border-color: #fecaca; background: var(--danger-bg); }
+  .turn .who { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); margin-bottom: 6px; }
+  .turn .text { white-space: pre-wrap; word-break: break-word; }
+  .turn .answer { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
+  .turn.blocked .answer { color: var(--danger); font-weight: 600; }
+
+  /* The guard rail: one row per detector per stage. */
+  .rail { margin-top: 10px; }
+  .rail .stage {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); margin: 10px 0 4px;
+  }
+  .finding {
+    display: flex; align-items: center; gap: 8px; padding: 4px 0;
+    font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .finding .badge {
+    border-radius: 4px; padding: 1px 6px; font-size: 11px; font-weight: 600;
+    border: 1px solid transparent; flex: none;
+  }
+  .finding .badge.pass { background: #ecfdf5; color: var(--ok); border-color: #a7f3d0; }
+  .finding .badge.block { background: var(--danger-bg); color: var(--danger); border-color: #fecaca; }
+  .finding .badge.warn { background: var(--warn-bg); color: var(--warn); border-color: #fde68a; }
+  .finding .who { color: var(--muted); flex: none; }
+  .finding .detail { color: var(--muted); }
+  .bar {
+    flex: none; width: 70px; height: 6px; border-radius: 3px;
+    background: #eef0f3; overflow: hidden;
+  }
+  .bar > span { display: block; height: 100%; background: var(--accent); }
+  .bar > span.hot { background: var(--danger); }
+  .reason { font-size: 12px; color: var(--danger); margin-top: 6px; }
+
+  .note {
+    font-size: 12px; color: var(--muted); background: var(--accent-soft);
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 12px;
+  }
+  .note code { background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CJet — the security guard</h1>
+  <p>
+    A LangChain agent with three guard positions: the input is checked <em>before</em> the
+    model runs, the tool arguments are checked <em>before</em> the tool runs, and the
+    model's own answer is checked <em>after</em> it is produced. A check that fires
+    stops the run and returns a blocked answer. <a href="/">← back to the main UI</a>
+  </p>
+</header>
+
+<main>
+  <section>
+    <div class="panel">
+      <h2>Send</h2>
+      <div class="row">
+        <div class="field">
+          <label class="ctl" for="model">Guard model — who checks for PII</label>
+          <select id="model"></select>
+        </div>
+        <div class="field">
+          <label class="ctl" for="path">Sub-path — which decision_lab head</label>
+          <select id="path" disabled></select>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label class="ctl" for="message">Message</label>
+          <textarea id="message" placeholder="Where is my order A1?"></textarea>
+        </div>
+      </div>
+      <div class="row" style="margin-top: 10px;">
+        <button class="primary" id="send">Send</button>
+        <span class="meta" id="status"></span>
+      </div>
+      <div class="row" style="margin-top: 12px;">
+        <div class="field">
+          <label class="ctl">Examples</label>
+          <div class="examples" id="examples"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>What this page is showing</h2>
+      <div class="note">
+        The <strong>guard model</strong> dropdown picks which model <em>checks</em> for PII.
+        The chat model that <em>answers</em> is separate
+        (<code id="chat-model">…</code>).
+      </div>
+      <div class="note">
+        The arms are not interchangeable. The same PII prompt scores about <strong>0.84</strong>
+        on the <code>english</code> checkpoint and about <strong>0.50</strong> on the
+        <code>doc</code> head, which was trained on one synthetic contact line rather
+        than on prose. The <code>typed</code> head is worse than useless on PII — it
+        scores the <em>clean</em> text higher. Switch the dropdown and resend to see it.
+      </div>
+      <div class="note">
+        A jailbreak finding is <em>reported</em> but does not block by default: the
+        measurement behind that is in the README. The secret scanner always blocks, on
+        every arm, because a matched key format is a fact and not a probability.
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="panel">
+      <h2>Transcript</h2>
+      <div id="transcript"><p class="muted">No turns yet.</p></div>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+// The guard UI.
+//
+// Two dropdowns, the same pair the other pages in this repo use: a model and (for the
+// decision_lab arms) a sub-path. The sub-path list comes from the running service, not
+// from a hardcoded array, so it cannot offer a head the service does not serve.
+//
+// The interesting part is the guard rail. A block here is not a silent refusal — every
+// turn shows what each detector said, at what score, and whether it stopped the run.
+
+const $ = (id) => document.getElementById(id);
+
+const state = { arms: [], byKey: {}, labPaths: [] };
+
+async function loadHealth() {
+  // A failed health call must not leave the page half-built. Without this, an empty
+  // arms list means an empty model dropdown, and every Send then posts model: "" and
+  // is rejected with "unknown model" — a confusing way to learn the server is down.
+  let body;
+  try {
+    const response = await fetch("/api/guard/health");
+    if (!response.ok) throw new Error(`health returned ${response.status}`);
+    body = await response.json();
+  } catch (error) {
+    $("status").textContent = "cannot reach the server: " + error.message;
+    $("send").disabled = true;
+    return;
+  }
+  state.arms = body.arms || [];
+  state.byKey = Object.fromEntries(state.arms.map((a) => [a.key, a]));
+  state.labPaths = body.lab_paths || [];
+  $("chat-model").textContent = body.chat_model;
+  renderArms();
+}
+
+function renderArms() {
+  const select = $("model");
+  select.innerHTML = "";
+  for (const arm of state.arms) {
+    const option = document.createElement("option");
+    option.value = arm.key;
+    option.textContent = arm.label;
+    select.appendChild(option);
+  }
+  select.value = "english";
+  select.addEventListener("change", syncPath);
+  syncPath();
+}
+
+function syncPath() {
+  const arm = state.byKey[$("model").value];
+  const path = $("path");
+  const isLab = arm && arm.kind === "lab";
+  path.disabled = !isLab;
+  path.innerHTML = "";
+  if (!isLab) return;
+  // The service's own list of sub-paths. If the service is down, the list is empty and
+  // the dropdown says so — offering a path the service is not serving would 400.
+  const paths = state.labPaths;
+  if (!paths.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "decision_lab is not reachable";
+    path.appendChild(option);
+    return;
+  }
+  for (const p of paths) {
+    const option = document.createElement("option");
+    option.value = p;
+    option.textContent = p;
+    path.appendChild(option);
+  }
+  if (arm.path && paths.includes(arm.path)) path.value = arm.path;
+}
+
+async function loadExamples() {
+  const response = await fetch("/api/guard/examples");
+  const examples = await response.json();
+  const box = $("examples");
+  for (const example of examples) {
+    const button = document.createElement("button");
+    button.className = "ghost";
+    button.textContent = example.label;
+    button.addEventListener("click", () => {
+      $("message").value = example.text;
+      $("message").focus();
+    });
+    box.appendChild(button);
+  }
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function renderTurn(message, body) {
+  const turn = el("div", "turn" + (body.blocked ? " blocked" : ""));
+
+  const who = el("div", "who", "you");
+  turn.appendChild(who);
+  turn.appendChild(el("div", "text", message));
+
+  const answer = el("div", "answer", body.answer);
+  turn.appendChild(answer);
+
+  const rail = el("div", "rail");
+  for (const event of body.guard_events || []) {
+    const stage = el("div", "stage", event.stage);
+    rail.appendChild(stage);
+    for (const finding of event.findings || []) {
+      rail.appendChild(renderFinding(finding));
+    }
+    if (event.reason) rail.appendChild(el("div", "reason", event.reason));
+  }
+  turn.appendChild(rail);
+
+  const foot = el("div", "meta",
+    `arm: ${body.arm}${body.path ? " / " + body.path : ""} · ${body.latency_ms} ms`);
+  foot.style.marginTop = "8px";
+  turn.appendChild(foot);
+
+  const transcript = $("transcript");
+  const empty = transcript.querySelector("p.muted");
+  if (empty) empty.remove();
+  transcript.appendChild(turn);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function renderFinding(finding) {
+  const row = el("div", "finding");
+  // The backend flags which finding stopped the run. Showing every finding in a
+  // blocked turn as "BLOCK" would say they all tripped, which is not what happened.
+  const badgeClass = finding.blocked ? "block" : "pass";
+  row.appendChild(el("span", "badge " + badgeClass, finding.blocked ? "BLOCK" : "pass"));
+  row.appendChild(el("span", "who", `${finding.detector}/${finding.category}`));
+
+  const hot = finding.score >= 0.3;
+  const bar = el("div", "bar");
+  const fill = el("span", hot ? "hot" : "");
+  fill.style.width = Math.round(Math.min(1, finding.score) * 100) + "%";
+  bar.appendChild(fill);
+  row.appendChild(bar);
+
+  row.appendChild(el("span", "detail", `${finding.score.toFixed(3)} ${finding.detail}`));
+  return row;
+}
+
+async function send() {
+  const message = $("message").value.trim();
+  if (!message) return;
+  const button = $("send");
+  button.disabled = true;
+  $("status").textContent = "checking…";
+
+  const body = { message, model: $("model").value };
+  const path = $("path");
+  if (!path.disabled && path.value) body.path = path.value;
+
+  try {
+    const response = await fetch("/api/guard/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || response.statusText);
+    renderTurn(message, result);
+    $("status").textContent = result.blocked ? "blocked" : "answered";
+  } catch (error) {
+    $("status").textContent = "error: " + error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("send").addEventListener("click", send);
+$("message").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) send();
+});
+
+loadHealth();
+loadExamples();
+</script>
+</body>
+</html>

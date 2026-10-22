@@ -9,7 +9,7 @@
 // It imports static/warehouse_sim.js, the same module the browser runs, so the
 // scenarios and the gold cannot drift from the demo.
 //
-//   uv run uvicorn server:app          # terminal 1
+//   uv run python -m uvicorn server:app          # terminal 1
 //   node eval_warehouse.mjs --model ciel_warehouse_v1
 //   node eval_warehouse.mjs --model ciel_decision_model_v1   # the before picture
 //

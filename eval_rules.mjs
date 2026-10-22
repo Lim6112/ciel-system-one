@@ -1,6 +1,6 @@
 // A/B harness for the fleet dispatch rules.
 //
-//   uv run uvicorn server:app        # terminal 1
+//   uv run python -m uvicorn server:app        # terminal 1
 //   node eval_rules.mjs --n 200 --seed 7
 //
 // Imports the same static/fleet_sim.js the browser does, so there is no second

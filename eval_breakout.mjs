@@ -1,6 +1,6 @@
 // A/B harness for the Breakout reachability ontology.
 //
-//   uv run uvicorn server:app        # terminal 1
+//   uv run python -m uvicorn server:app        # terminal 1
 //   node eval_breakout.mjs --n 150 --seed 7
 //
 // THE ONES YOU ASKED FOR: `ontology-off` is the naive baseline — every ball gets asked
@@ -429,7 +429,7 @@ if (args.loop === true || args.loop === "true") {
     }
   } catch (err) {
     console.log(`  skipped: no server at ${ENDPOINT} (${err.message}).`);
-    console.log(`  Start one with \`uv run uvicorn server:app\`, or skip this section ` +
+    console.log(`  Start one with \`uv run python -m uvicorn server:app\`, or skip this section ` +
                 `entirely by not passing --loop.\n`);
     process.exit(0);
   }

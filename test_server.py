@@ -1,6 +1,6 @@
 """Tests for the /api/predict endpoint with a stubbed router (no model load).
 
-uv run pytest test_server.py
+uv run python -m pytest test_server.py
 """
 
 from __future__ import annotations

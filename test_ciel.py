@@ -4,7 +4,7 @@ The mapping between laya's question/answer shapes and decision_lab's
 positional-answers API is where this integration can silently drift, so these
 tests pin it directly.
 
-uv run pytest test_ciel.py
+uv run python -m pytest test_ciel.py
 """
 
 from __future__ import annotations

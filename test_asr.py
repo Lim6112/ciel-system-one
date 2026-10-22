@@ -9,7 +9,7 @@ the README.
 So this file covers the two things that actually break in practice — WAV decoding, and the
 HF_HUB_OFFLINE window that stands between a first run and a working model.
 
-Run: uv run pytest test_asr.py
+Run: uv run python -m pytest test_asr.py
 """
 
 from __future__ import annotations
