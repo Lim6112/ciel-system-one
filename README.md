@@ -1829,6 +1829,151 @@ its own process on import. That is deliberately *not* a change to `ciel.py`: on 
 machine with no proxy configured, `ciel.py` is correct as written, and a shared
 client should not carry one machine's network environment.
 
+## The traffic guard — a network under attack, defended by declared rules
+
+`guard.html` shows the guard reading **one message**. It answers "can the guard read a
+message?", not "what does the guard do to a network under attack?". `static/traffic.html`
+answers the second: a simulated network, packets crossing a guard node, and a **response**
+chosen for each one — `Allow`, `Inspect`, `RateLimit`, `Drop` or `Quarantine` — with the
+rule that decides it declared as ontology axioms rather than written as an `if`.
+
+```sh
+uv run python -m uvicorn server:app                       # then open http://localhost:8000/traffic.html
+```
+
+The modules are `traffic_sim.js` (topology, packet taxonomy, payload grammars, the
+structural layer), `traffic_ontology.js` (the defence rule and the divergence harness),
+`traffic_panel.js` (the live TBox editor) and `traffic.html`. One new endpoint,
+`POST /api/guard/scan`, and no new model: the content check is the guard `guard.html`
+already uses, over the same arms.
+
+### Why this needs three layers, and where each one lives
+
+A flood has no payload. `SecretScanner.scan` and the `sensitive_data` latent are functions
+of a **string**, and a SYN flood is a **shape over time** — so a text detector has nothing
+to read, and a page that claimed otherwise would be lying about the one scenario it exists
+to show. The guard node is therefore two layers, and every packet's row names the one that
+fired:
+
+| layer | lives in | catches | can it block? |
+|---|---|---|---|
+| **structural** | `traffic_sim.js` | per-source packet rate in a sliding window; distinct-port sweep | yes — a rate or port pattern is a fact about the flow |
+| **content** | `guard_pii.Guard`, via `/api/guard/scan` | PII, provider keys, injection payloads | yes, per the policy `guard.html` documents |
+
+The structural layer is in the page, not on the server, because the server sees a stream of
+independent scan requests and has no notion of "source". The page owns the source, so the
+page owns the rate window.
+
+A third layer then **decides what to do about** those facts, and that one is the ontology.
+
+### Why the defence rule is declared rather than written
+
+`warehouse_ontology.js` states the reason better than this can, and it is the same reason:
+the hand-written predicate was "not wrong, but it cannot be checked". Its twin drifted away
+from it and robots ended up pinned in a permanent standoff (791 deferred against 40
+decided). Traffic defence has the same shape of risk — "a source over the rate limit may
+not be allowed", "a confirmed secret is not re-inspected" — and left as `if`s in
+`traffic_sim.js` they drift from what the page enforces, with the same result: the UI
+enforcing a disposition the rule never permitted.
+
+So the rule is declared as axioms, in the same four forms `warehouse` uses
+(`maxCardinality` / `minCardinality` / `range` / `disjoint` — an OWL-RL subset, closed
+world). `divergence()` runs the declared reasoner and a hand-written twin over every
+passage the simulator produces and requires **zero disagreements**.
+
+`node --test test_traffic_ontology.mjs` reports that comparison, and one of its tests
+deliberately breaks an axiom to confirm the check can fail — a check that cannot fail
+proves nothing.
+
+### The response vocabulary, and why destroying traffic is escalation-only
+
+```
+Allow  <  Inspect  <  RateLimit  <  Drop  <  Quarantine
+```
+
+Only `Allow` forwards a flow to the server; the axiom `allow-means-forward` declares that,
+so a rule that concluded `Allow` while the page drew the packet toward the sink is
+reportable rather than silent.
+
+`Drop` and `Quarantine` are **not** in the base set, and that is the same move
+`warehouse_ontology.js` makes with `backward`: destroying traffic is not something you
+reach for by default. A first offence is rate-limited; only a source that has already had a
+flow blocked may be dropped or quarantined, which `first-offence-not-dropped` and
+`repeat-offender-admits-drop` declare between them.
+
+That pair is also where an inert axiom was caught. The first version granted `Drop` to a
+repeat offender while `Drop` was already available to everyone, so the grant changed
+nothing — it declared a rule that never altered a decision. The two axioms now target
+different responses on purpose, and the escalation is measurable: `flood` permits
+`Inspect/RateLimit` for a first offence and `Inspect/RateLimit/Drop/Quarantine` for a
+repeat.
+
+### Unchecked is not clean
+
+The `Inspect` response exists for one reason. `guard_pii.py` reports a detector it cannot
+reach as a finding rather than an error, because *"a caller that cannot tell 'checked,
+nothing found' from 'could not check' will read a blind spot as a clean bill of health."*
+On a page where most rows read `passed`, that is the default failure rather than an edge
+case. So an unverified payload is typed `UnverifiedContent`, `Allow` is withdrawn, and the
+flow is held at the guard.
+
+The same applies to the arms. On `ciel_*`, `jev` and `typed-decisions` the model's PII
+score is reported and **cannot** block — `Arm.model_pii_blocks`, measured in
+`guard_pii.py` — so a hit there leaves the flow unverified rather than blocked. Switching
+the arm on this page to `ciel_typed_v1` and sending PII shows the difference: the flow is
+held, and the row says the arm had no standing to block.
+
+A production guard would fail **closed** here. This demo shows the fail-open path on
+purpose, so the failure is visible rather than hidden.
+
+### A model is only asked when there is something to decide
+
+If no rule fired, the whole base set is available and the flow is allowed
+deterministically — no model call, because there is nothing to decide. Once a rule narrows
+the set, the ontology asks the arm which permitted response to use, and the permitted set
+**is** the option set: the model cannot name a response the rule withdrew, because those
+are not in the criteria. An answer outside the menu is refused and the safest permitted
+response is used instead.
+
+That gate had a subtle bug worth recording. "Did anything fire?" was checked by comparing
+the size of the permitted set against the base set — and a confirmed secret from a repeat
+source yields `{RateLimit, Drop, Quarantine}`, three members, the same count as the base
+set. Every leaked key was therefore reported as "no rule fired" and allowed. The sizes
+matching was a coincidence of how the withdrawals compose, and a coincidental match is
+exactly what a length check cannot tell from the real thing. It is now a set comparison,
+with a test in the exact shape that failed.
+
+### Pacing, and what the guard cannot keep up with
+
+A laya scan is ~35 ms on an MPS machine and runs under the same `device_lock` as
+`/api/predict`, so the process tops out near 28 scans/sec. One click sends a burst of 20,
+the guard keeps at most 6 scans in flight, and a packet that waits longer than that is
+marked **sampled out** — never `passed`, and counted separately. The HUD shows
+`inspected / seen`, so the gap is on screen rather than in a footnote: a flood visibly
+outruns the guard, which is the honest limit of inspecting payloads one at a time.
+
+A burst is sized deliberately above the thresholds. Sent at exactly the limit (12 against a
+limit of 12) it would trip the rule on its last packet and nothing else, so a "flood" would
+drop one packet and allow eleven — technically correct, and misleading on screen. It is
+also the honest shape of rate limiting: the first packets of any burst get through. That is
+why a rate limiter belongs in front of an inspector rather than instead of one.
+
+### What is not claimed
+
+- A flood is stopped by the **rate** rule, never by the model. That is a feature of this
+  page, not a defect: showing that a text detector has nothing to say about a SYN is the
+  point.
+- Per-source rate windows are defeated by source spoofing — a flood that rotates its
+  apparent source trips neither layer. That is a true statement about per-source limiting
+  and a good lesson, but as a random draw it would just look like the demo is broken, so
+  it ships as an off-by-default toggle rather than a surprise.
+- The structural thresholds (`RATE_FLOOD_THRESHOLD`, `SWEEP_PORT_THRESHOLD`) are named
+  constants at the top of `traffic_sim.js`, chosen to be legible rather than calibrated.
+  They are meant to be tuned by hand.
+- Switching arms does not restart the run — packets are independent, unlike
+  `warehouse.html`'s routes — so a per-arm comparison rests on the arm label each row
+  carries.
+
 ## Startup performance
 
 Stock `laya` + `Router(preload=True)` spent ~100s before the first prediction on

@@ -429,8 +429,14 @@ EXAMPLES: list[dict[str, str]] = [
 ]
 
 
-class ChatRequest(BaseModel):
-    """One turn: the message, and which arm should check it."""
+class GuardRequest(BaseModel):
+    """One guarded item: the text, and which arm should check it.
+
+    Shared by `/api/guard/chat` (a conversation turn) and `/api/guard/scan` (one packet's
+    payload). Named for the guard rather than for chat because the scan route has no chat
+    model in it at all, and a second identical model would be a second place for
+    MAX_MESSAGE_CHARS to drift.
+    """
 
     message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     model: str = "english"
@@ -491,7 +497,7 @@ def guard_examples() -> list[dict[str, str]]:
 
 
 @app.post("/api/guard/chat")
-def guard_chat(request: ChatRequest) -> dict[str, Any]:
+def guard_chat(request: GuardRequest) -> dict[str, Any]:
     """One guarded turn.
 
     Deliberately a SYNC route, not an async one. The agent call is blocking (a local
@@ -527,6 +533,59 @@ def guard_chat(request: ChatRequest) -> dict[str, Any]:
         )
     latency_ms = round((time.perf_counter() - start) * 1000, 1)
     return {**result, "latency_ms": latency_ms}
+
+
+@app.post("/api/guard/scan")
+def guard_scan_text(request: GuardRequest) -> dict[str, Any]:
+    """Inspect one piece of text with the arm's detectors. No model writes an answer.
+
+    This is the traffic demo's content tier. A packet payload is not a conversation turn:
+    there is nothing to answer and no tool to call, so running the LangChain agent would
+    pay for two chat-model round trips per packet to produce an answer nobody reads. It
+    runs the same detectors, over the same arms, under the same policy.
+
+    Sync `def` for the reason `guard_chat` gives at length — the scan runs a torch forward
+    pass and takes a `threading.Lock`, and an `async` route holding that lock across an
+    `await` deadlocks the server. Same lock too (`device_lock`, shared with /api/predict),
+    because the crash it prevents is scoped to the process's Metal device. Taken
+    unconditionally, even for the lab and jev arms that never touch the device: one rule is
+    easier to defend than an arm-kind conditional.
+
+    The guard is `_live_guard()` — the one the lifespan built with the process's router —
+    so a scan reuses the resident checkpoint rather than loading a second copy. It calls
+    `guard.scan` directly and must NOT call `guarded.with_arm`, which is how `guard_agent.chat`
+    swaps the shared middleware's arm: a traffic scan would otherwise silently change the
+    arm the next `/api/guard/chat` runs with.
+
+    `stage=INPUT_STAGE` because a payload is text arriving from the network before any
+    model sees it, and input is the only stage where the policy lets the MODEL's PII
+    opinion block. `arm_model_pii_blocks` is returned so the page can say the true thing
+    on the arms that report without the standing to block.
+    """
+    try:
+        arm = guard_pii.resolve_arm(request.model, request.path)
+    except guard_pii.ArmError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    guard = _live_guard()
+    if guard is None:
+        raise HTTPException(status_code=503, detail="guard is still loading")
+
+    start = time.perf_counter()
+    with _RouterState.device_lock:
+        report = guard.scan(request.message, arm, stage=guard_pii.INPUT_STAGE)
+    latency_ms = round((time.perf_counter() - start) * 1000, 1)
+    return {
+        "blocked": report.blocked,
+        "reason": report.reason,
+        "arm": arm.key,
+        "path": arm.path,
+        "arm_model_pii_blocks": report.arm_model_pii_blocks,
+        # The same serializer the chat trace uses, so the two routes cannot drift to two
+        # answers about which finding was the blocker.
+        "findings": guard_agent._findings_payload(report),
+        "latency_ms": latency_ms,
+    }
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

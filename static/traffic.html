@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CJet inspects the traffic</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #d9dde3; --text: #1c2128;
+    --muted: #6b7280; --accent: #4f46e5; --accent-soft: #eef2ff;
+    --danger: #b91c1c; --danger-bg: #fef2f2; --ok: #047857; --warn: #b45309;
+    --warn-bg: #fffbeb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { margin: 0; font-size: 17px; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; max-width: 78ch; }
+  header a { color: var(--accent); text-decoration: none; }
+  header a:hover { text-decoration: underline; }
+  main {
+    display: grid; grid-template-columns: minmax(440px, 6fr) minmax(340px, 5fr);
+    gap: 20px; padding: 20px 24px; max-width: 1320px; margin: 0 auto;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  .panel h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase;
+    letter-spacing: 0.04em; color: var(--muted); }
+  canvas { display: block; width: 100%; background: #111827; border-radius: 8px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin-top: 10px; }
+  .controls label { color: var(--muted); font-size: 12px; }
+  button, select {
+    font: inherit; border: 1px solid var(--border); border-radius: 6px;
+    padding: 5px 11px; background: #fff; cursor: pointer; color: var(--text); font-size: 13px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent);
+    color: #fff; font-weight: 600; }
+  button.primary:hover { opacity: 0.9; color: #fff; }
+  button.attack { border-color: #fecaca; color: var(--danger); }
+  button.attack:hover { background: var(--danger-bg); }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .field { flex: 1; }
+  label.ctl { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+  select { width: 100%; }
+  .muted { color: var(--muted); }
+  .meta { color: var(--muted); font-size: 12px; }
+  .banner { padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; font-size: 13px; }
+  .banner.error { background: var(--danger-bg); color: var(--danger);
+    border: 1px solid #fecaca; }
+  .banner.warn { background: var(--warn-bg); color: var(--warn); border: 1px solid #fde68a; }
+  .banner.hidden { display: none; }
+  .hud { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--muted);
+    font-size: 12px; margin: 10px 0 2px; }
+  .hud strong { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  /* the verdict ledger */
+  #ledger { max-height: 460px; overflow-y: auto; }
+  .entry { border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
+    margin-bottom: 8px; border-left-width: 4px; }
+  .entry.allow { border-left-color: var(--ok); }
+  .entry.inspect { border-left-color: #2563eb; }
+  .entry.ratelimit { border-left-color: #b45309; }
+  .entry.drop { border-left-color: var(--danger); }
+  .entry.quarantine { border-left-color: #7c3aed; }
+  .entry .top { display: flex; justify-content: space-between; gap: 8px;
+    align-items: baseline; margin-bottom: 4px; }
+  .entry .kind { font-weight: 600; font-size: 13px; }
+  .entry .src { color: var(--muted); font-size: 11px; }
+  .entry .payload { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; color: var(--muted); word-break: break-all; margin: 3px 0 6px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; }
+  .badge.allow { background: #ecfdf5; color: var(--ok); }
+  .badge.inspect { background: #eff6ff; color: #2563eb; }
+  .badge.ratelimit { background: var(--warn-bg); color: var(--warn); }
+  .badge.drop { background: var(--danger-bg); color: var(--danger); }
+  .badge.quarantine { background: #f5f3ff; color: #7c3aed; }
+  .tiers { font-size: 11.5px; }
+  .tiers .tier { display: inline-block; margin-right: 10px; }
+  .tiers .tier b { font-weight: 600; }
+  .findings { margin-top: 6px; }
+  .finding { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+  .finding .fbar { flex: 0 0 54px; height: 6px; background: var(--accent-soft);
+    border-radius: 3px; overflow: hidden; }
+  .finding .fbar span { display: block; height: 100%; background: var(--accent); }
+  .finding .fbar span.hot { background: var(--danger); }
+  .finding .fdetail { color: var(--muted); }
+  .why { font-size: 11.5px; color: var(--muted); margin-top: 5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CJet inspects the traffic</h1>
+  <p>
+    A simulated network under attack. Packets cross the guard node, the guard decides a
+    <strong>response</strong>, and the response is declared as ontology axioms rather than
+    written as an <code>if</code>. · <a href="/">← back to the main UI</a>
+    · <a href="/guard.html">🛡️ the guard on one message</a>
+  </p>
+</header>
+
+<main>
+  <section>
+    <div class="panel">
+      <h2>Network</h2>
+      <div id="banner" class="banner hidden"></div>
+      <canvas id="sim" width="600" height="460"></canvas>
+      <div class="hud" id="hud"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Traffic</h2>
+      <div class="controls">
+        <button class="primary" id="toggle">start</button>
+        <button id="clear">clear</button>
+        <span class="meta" id="status"></span>
+      </div>
+      <div class="controls">
+        <label>send one</label>
+        <button data-kind="order_lookup">order lookup</button>
+        <button data-kind="http_get">http get</button>
+        <button data-kind="health_probe">health probe</button>
+      </div>
+      <div class="controls">
+        <label>attack</label>
+        <button class="attack" data-kind="flood" data-source="a1">SYN flood</button>
+        <button class="attack" data-kind="port_scan" data-source="a1">port sweep</button>
+        <button class="attack" data-kind="pii_exfil" data-source="c1">PII exfil</button>
+        <button class="attack" data-kind="key_leak" data-source="c1">key leak</button>
+        <button class="attack" data-kind="injection" data-source="a1">injection</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Guard — which arm checks the payload</h2>
+      <div class="row">
+        <div class="field">
+          <label class="ctl" for="model">Model arm</label>
+          <select id="model"></select>
+        </div>
+        <div class="field">
+          <label class="ctl" for="path">Sub-path — which decision_lab head</label>
+          <select id="path" disabled></select>
+        </div>
+      </div>
+      <div class="meta" id="armNote"></div>
+    </div>
+
+    <div class="panel">
+      <h2>방어 — 선언된 규칙</h2>
+      <p class="meta" style="margin-top:0">
+        패킷의 운명을 정하는 규칙을 공리로 선언한 것입니다. 공리를 제거하면 그 규칙은
+        더 이상 주장되지 않으며, 패널이 실패 대신 그 사실을 알립니다.
+      </p>
+      <div id="ontologyPanel"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="panel">
+      <h2>Verdicts</h2>
+      <div id="ledger"><p class="muted">No packet has reached the guard yet.</p></div>
+    </div>
+    <div class="panel">
+      <h2>What this page is showing</h2>
+      <div class="meta">
+        <p><strong>Two layers decide.</strong> The <em>structural</em> layer (in the page)
+        catches a rate or a port sweep, which are shapes over time and have no payload to
+        read. The <em>content</em> layer is the repo's real guard, over the arm you pick,
+        catching PII and credentials. Each row names the tier that fired.</p>
+        <p><strong>A model is only asked when there is something to decide.</strong> If no
+        rule fired, the whole base response set is available and the flow is allowed
+        deterministically. Narrow it and the ontology asks the arm which permitted
+        response to use — the model chooses from the ontology's menu, never outside it.</p>
+        <p><strong>Unchecked is not clean.</strong> When the content tier cannot answer,
+        the flow is <em>unverified</em>, not safe: Allow is withdrawn and the flow is held
+        at the guard. A production guard would fail closed here; this demo shows the
+        failure rather than hiding it, so a blind spot is visible.</p>
+        <p><strong>Destroying traffic is escalation-only.</strong> A first offence is
+        rate-limited. Only a source that has already had a flow blocked may be dropped or
+        quarantined — that is an axiom, not a preference.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+"use strict";
+
+// Geometry, the packet taxonomy, the payload grammars and the structural rate/port
+// detector live in traffic_sim.js; the defence rule lives in traffic_ontology.js. Both are
+// pure and DOM-free, so node --test drives the shipped code rather than a copy. This file
+// is only the DOM and canvas layer over them.
+import * as S from "./traffic_sim.js";
+import { mountTrafficPanel, permittedFor } from "./traffic_panel.js";
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("sim");
+const ctx = canvas.getContext("2d");
+
+let sim = S.createSim({ seed: 1 });
+let running = false;
+let lastTime = 0;
+
+// The arm/sub-path dropdown, fetched from the guard's own health route so it cannot drift
+// from what the server offers.
+const guardState = { arms: [], byKey: {}, labPaths: [], loaded: [] };
+
+// The passage the ontology panel reads. Replaced each time a packet reaches the guard.
+let lastPassage = null;
+
+// ---- the arm dropdown, ported from guard.html ----------------------------------------
+
+async function loadHealth() {
+  try {
+    const response = await fetch("/api/guard/health");
+    if (!response.ok) throw new Error(`health returned ${response.status}`);
+    const body = await response.json();
+    guardState.arms = body.arms || [];
+    guardState.byKey = Object.fromEntries(guardState.arms.map((a) => [a.key, a]));
+    guardState.labPaths = body.lab_paths || [];
+    guardState.loaded = body.loaded_checkpoints || [];
+    renderArms();
+  } catch (error) {
+    showBanner(`cannot reach the guard: ${error.message}`, "error");
+    $("toggle").disabled = true;
+  }
+}
+
+function renderArms() {
+  const select = $("model");
+  select.innerHTML = "";
+  for (const arm of guardState.arms) {
+    const option = document.createElement("option");
+    option.value = arm.key;
+    option.textContent = arm.label;
+    select.appendChild(option);
+  }
+  select.value = "english";
+  select.addEventListener("change", syncArm);
+  syncArm();
+}
+
+function syncArm() {
+  const arm = guardState.byKey[$("model").value];
+  const path = $("path");
+  const isLab = arm && arm.kind === "lab";
+  path.disabled = !isLab;
+  path.innerHTML = "";
+  if (!isLab) {
+    path.appendChild(new Option("— this arm has no sub-paths —", ""));
+  } else if (!guardState.labPaths.length) {
+    path.appendChild(new Option("decision_lab is not reachable", ""));
+  } else {
+    for (const p of guardState.labPaths) path.appendChild(new Option(p, p));
+  }
+  // An arm whose PII opinion cannot block, and a checkpoint that is not resident, are both
+  // things the user needs to know BEFORE trusting a verdict.
+  const notes = [];
+  if (arm && arm.kind === "laya" && !guardState.loaded.includes(arm.key)) {
+    notes.push(`${arm.key} is not loaded — the first scan will pause while it loads.`);
+  }
+  if (arm && !armIsAuthoritative(arm)) {
+    notes.push("This arm reports its PII score but cannot block on it, so a hit here " +
+               "leaves the flow unverified and it is held at the guard.");
+  }
+  $("armNote").textContent = notes.join(" ");
+}
+
+/** Whether this arm's PII opinion is allowed to block, per guard_pii.ARMS. */
+function armIsAuthoritative(arm) {
+  return arm.kind === "laya" && (arm.key === "english" || arm.key === "multilingual");
+}
+
+function currentArm() { return $("model").value; }
+
+function banner(text, kind) {
+  const el = $("banner");
+  el.textContent = text;
+  el.className = `banner ${kind}`;
+}
+
+function showBanner(text, kind) { banner(text, kind); }
+function hideBanner() { $("banner").className = "banner hidden"; }
+
+// ---- reaching the guard ---------------------------------------------------------------
+
+/**
+ * Ask the guard about one payload.
+ *
+ * Everything that can go wrong here is surfaced as `{unavailable: reason}` rather than
+ * thrown: a timeout, a non-2xx, an unparseable body. A failed scan is NOT a pass, and the
+ * ontology turns it into UnverifiedContent, which withdraws Allow.
+ */
+async function scanPayload(packet) {
+  const request = S.buildScanRequest(packet, currentArm(), $("path").disabled ? null : $("path").value);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), S.SCAN_TIMEOUT_MS);
+  try {
+    const response = await fetch("/api/guard/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) {
+      return { unavailable: true, reason: body?.detail || `HTTP ${response.status}`, latency: 0 };
+    }
+    return {
+      latency: body.latency_ms,
+      arm: body.arm,
+      // The server's own verdict, kept so the row can show both what the ontology
+      // concluded and what the detector said.
+      blocked: body.blocked,
+      findings: body.findings || [],
+      unavailable: (body.findings || []).some((f) => f.category === "detector_unavailable"),
+      secret: (body.findings || []).some((f) => f.category === "secret" && f.score >= 1),
+      pii: (body.findings || []).some((f) => f.category === "pii" && (f.blocked || f.score >= 0.3)),
+      armModelPiiBlocks: body.arm_model_pii_blocks,
+    };
+  } catch (error) {
+    const reason = error.name === "AbortError"
+      ? `scan timed out after ${S.SCAN_TIMEOUT_MS} ms`
+      : `scan failed: ${error.message}`;
+    return { unavailable: true, reason, latency: 0 };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---- the decision loop ------------------------------------------------------------------
+
+/**
+ * Decide one packet, in the order the layers are stacked.
+ *
+ * 1. The structural layer already fired at spawn, if it was going to.
+ * 2. The ontology computes the permitted response set from the facts.
+ * 3. If nothing fired, the flow is allowed deterministically — no model call, because
+ *    there is nothing to decide.
+ * 4. Otherwise the model is asked to choose from the permitted set. Its answer is
+ *    validated against that set before it is enforced; an answer outside the menu is
+ *    refused and the safest permitted response is used instead.
+ */
+async function decide(packet) {
+  const passage = {
+    sourceId: packet.sourceId,
+    kind: packet.kind,
+    quarantined: sim.quarantine.has(packet.sourceId),
+    priorViolations: sim.violations.get(packet.sourceId) || 0,
+    structural: packet.structural,
+    content: null,
+  };
+
+  if (packet.structural.blocked) {
+    // Structurally decided. No payload was read, so no content verdict exists and the
+    // ontology is asked with content: null.
+    lastPassage = passage;
+    const verdict = permittedFor(passage);
+    const response = pickResponse(verdict.options, packet.structural.rule);
+    record(packet, response, verdict, {
+      tier: "structural",
+      reason: packet.structural.detail,
+      model: null,
+      findings: [],
+    });
+    return;
+  }
+
+  const content = await scanPayload(packet);
+  S.noteScanResult(sim, content.latency || 0, !content.unavailable);
+  if (sim.contentTier === "unavailable") {
+    banner(sim.contentTierReason, "warn");
+  }
+  passage.content = content.unavailable
+    ? { unavailable: true }
+    : { secret: content.secret, pii: content.pii };
+  lastPassage = passage;
+
+  const verdict = permittedFor(passage);
+  if (verdict.undecided) {
+    record(packet, S.RESPONSE.ALLOW, verdict, {
+      tier: "none",
+      reason: "no rule fired — the whole base set is permitted, so the flow is allowed",
+      model: null,
+      findings: content.findings || [],
+    });
+    return;
+  }
+
+  const chosen = await chooseResponse(passage, verdict.options);
+  record(packet, chosen.response, verdict, {
+    tier: content.unavailable ? "content (unavailable)" : "content",
+    reason: chosen.reason,
+    model: chosen.model,
+    findings: content.findings || [],
+  });
+}
+
+/**
+ * Ask the model to choose a response from the ontology's menu.
+ *
+ * The allowed set IS the option set: the model cannot name a response the ontology
+ * withdrew, because those are not in the criteria. The answer is still validated, because
+ * a model arm is a model and the menu is the rule.
+ */
+async function chooseResponse(passage, options) {
+  const criteria = {};
+  for (const option of options) criteria[option] = RESPONSE_CRITERIA[option];
+  const question = {
+    type: "choice",
+    instructions: "Choose the response to serve this traffic with. Only the listed " +
+                  "responses are permitted for this flow.",
+    criteria,
+  };
+  try {
+    const response = await fetch("/api/predict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        state: {
+          flow_source: passage.sourceId,
+          packet_kind: passage.kind,
+          structural_rule: passage.structural?.rule || "none",
+          content_verdict: passage.content?.unavailable ? "unverified"
+            : passage.content?.secret ? "confirmed credential"
+            : passage.content?.pii ? "confirmed personal data"
+            : "clean",
+          prior_blocked_flows: String(passage.priorViolations || 0),
+        },
+        questions: { response: question },
+        model: currentArm(),
+      }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || response.statusText);
+    const answer = body.result.answers.response;
+    const choice = answer.choice;
+    if (!options.includes(choice)) {
+      // Outside the menu. Refuse it and take the safest permitted response rather than
+      // enforcing something the rule never allowed.
+      return {
+        response: safest(options),
+        model: null,
+        reason: `the model answered "${choice}", which is not permitted for this flow; ` +
+                `held on "${safest(options)}" instead`,
+      };
+    }
+    return {
+      response: choice,
+      model: choice,
+      reason: `${currentArm()} chose ${choice} from the permitted set ` +
+              `(${options.join(" / ")})`,
+    };
+  } catch (error) {
+    return {
+      response: safest(options),
+      model: null,
+      reason: `could not ask the model (${error.message}); held on "${safest(options)}"`,
+    };
+  }
+}
+
+const RESPONSE_CRITERIA = {
+  [S.RESPONSE.ALLOW]: "the traffic is ordinary and should reach the server",
+  [S.RESPONSE.INSPECT]: "the traffic is not confirmed safe and should be examined further",
+  [S.RESPONSE.RATE_LIMIT]: "the source is sending too much and should be throttled",
+  [S.RESPONSE.DROP]: "the traffic is hostile and should be discarded",
+  [S.RESPONSE.QUARANTINE]: "the source is hostile and all of its traffic should be held",
+};
+
+/** The most cautious response in a set, as an order of least-to-most destructive. */
+function safest(options) {
+  const rank = (r) => S.RESPONSE_ORDER.indexOf(r);
+  return [...options].sort((a, b) => rank(b) - rank(a))[0];
+}
+
+/** For a structurally decided packet, the rule names the response directly. */
+function pickResponse(options, rule) {
+  const preferred = S.responseForRule(rule);
+  return options.includes(preferred) ? preferred : safest(options);
+}
+
+// ---- the ledger ---------------------------------------------------------------------------
+
+const RESPONSE_CLASS = {
+  [S.RESPONSE.ALLOW]: "allow",
+  [S.RESPONSE.INSPECT]: "inspect",
+  [S.RESPONSE.RATE_LIMIT]: "ratelimit",
+  [S.RESPONSE.DROP]: "drop",
+  [S.RESPONSE.QUARANTINE]: "quarantine",
+};
+
+function record(packet, response, verdict, detail) {
+  // Apply it to the sim: this is what routes the packet and moves the counters.
+  const applied = S.applyResponse(sim, packet, response, detail.reason, detail.model);
+  const index = sim.packets.findIndex((p) => p.id === packet.id);
+  if (index >= 0) sim.packets[index] = applied;
+  addRow(packet, response, verdict, detail);
+  renderHud();
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function addRow(packet, response, verdict, detail) {
+  const ledger = $("ledger");
+  const empty = ledger.querySelector("p.muted");
+  if (empty) empty.remove();
+
+  const entry = el("div", `entry ${RESPONSE_CLASS[response]}`);
+  const top = el("div", "top");
+  top.appendChild(el("span", "kind", packet.kind));
+  top.appendChild(el("span", "src", `from ${packet.sourceId}`));
+  top.appendChild(el("span", `badge ${RESPONSE_CLASS[response]}`, response));
+  entry.appendChild(top);
+  entry.appendChild(el("div", "payload", packet.text));
+
+  const tiers = el("div", "tiers");
+  const structural = verdict.structuralType
+    ? `structural: <b>${verdict.structuralType}</b>`
+    : "structural: clear";
+  const content = verdict.contentType
+    ? `content: <b>${verdict.contentType}</b>`
+    : "content: ignored (decided before the payload)";
+  tiers.innerHTML = `<span class="tier">${structural}</span>` +
+                    `<span class="tier">${content}</span>`;
+  entry.appendChild(tiers);
+
+  if (detail.findings.length) {
+    const box = el("div", "findings");
+    for (const finding of detail.findings) {
+      const row = el("div", "finding");
+      row.appendChild(el("span", "fdetail", `${finding.detector}/${finding.category}`));
+      const bar = el("div", "fbar");
+      const fill = el("span", finding.score >= 0.3 ? "hot" : "");
+      fill.style.width = `${Math.round(Math.min(1, finding.score) * 100)}%`;
+      bar.appendChild(fill);
+      row.appendChild(bar);
+      row.appendChild(el("span", "fdetail", `${finding.score.toFixed(3)} ${finding.detail}`));
+      box.appendChild(row);
+    }
+    entry.appendChild(box);
+  }
+
+  entry.appendChild(el("div", "why",
+    `${detail.tier} — ${detail.reason}` +
+    (detail.model ? ` · model chose ${detail.model}` : " · no model call")));
+  if (verdict.violations.length) {
+    for (const violation of verdict.violations) {
+      entry.appendChild(el("div", "why", `⚠ ${violation.axiom}: ${violation.detail}`));
+    }
+  }
+
+  ledger.prepend(entry);
+  while (ledger.children.length > 40) ledger.removeChild(ledger.lastChild);
+}
+
+function renderHud() {
+  const c = S.counters(sim);
+  const p = S.pacing(sim);
+  $("hud").innerHTML = [
+    `seen <strong>${c.spawned}</strong>`,
+    `inspected <strong>${c.inspected}</strong>`,
+    `allowed <strong>${c.allowed}</strong>`,
+    `rate-limited <strong>${c.rateLimited}</strong>`,
+    `dropped <strong>${c.dropped}</strong>`,
+    `quarantined <strong>${c.quarantined}</strong>`,
+    `unavailable <strong>${c.unavailable}</strong>`,
+    `sampled out <strong>${c.deferred}</strong>`,
+    `mean scan <strong>${p.scanMsMean ? p.scanMsMean.toFixed(0) + " ms" : "—"}</strong>`,
+  ].join(" · ");
+}
+
+// ---- drawing -------------------------------------------------------------------------------
+
+function draw() {
+  ctx.clearRect(0, 0, S.W, S.H);
+
+  // edges, dashed, so the flow reads as a path rather than a wire
+  ctx.strokeStyle = "#374151";
+  ctx.setLineDash([4, 6]);
+  ctx.lineWidth = 1;
+  for (const edge of S.EDGES) {
+    const from = S.NODES[edge.from];
+    const to = S.NODES[edge.to];
+    ctx.beginPath();
+    ctx.moveTo(from.x, from.y);
+    ctx.lineTo(to.x, to.y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // the guard: a double ring, so the choke point is unmistakable
+  const guard = S.NODES.guard;
+  ctx.strokeStyle = "#6366f1";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(guard.x, guard.y, 26, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(guard.x, guard.y, 20, 0, Math.PI * 2);
+  ctx.stroke();
+
+  for (const node of Object.values(S.NODES)) {
+    drawNode(node);
+  }
+
+  // packets
+  for (const packet of sim.packets) {
+    const path = packet.phase === "inbound"
+      ? S.inboundPath(packet.sourceId, packet.lane)
+      : S.outboundPath(packet.destination || "drop", packet.lane);
+    const at = S.pointAt(path, packet.t);
+    const color = packet.response
+      ? S.RESPONSE_COLORS[packet.response]
+      : "#94a3b8";
+    ctx.save();
+    ctx.translate(at.x, at.y);
+    ctx.rotate(at.angle);
+    ctx.fillStyle = color;
+    ctx.fillRect(-S.PACKET_W / 2, -S.PACKET_H / 2, S.PACKET_W, S.PACKET_H);
+    ctx.restore();
+  }
+
+  // labels last, so nothing is drawn over them
+  ctx.font = "10px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#e5e7eb";
+  for (const node of Object.values(S.NODES)) {
+    ctx.fillText(node.label, node.x, node.y + (node.kind === "guard" ? 42 : 20));
+  }
+  ctx.fillText("CJet guard", guard.x, guard.y + 42);
+}
+
+function drawNode(node) {
+  ctx.strokeStyle = "#6b7280";
+  ctx.fillStyle = "#1f2937";
+  ctx.lineWidth = 1;
+  if (node.kind === "attacker") {
+    ctx.fillStyle = "#7f1d1d";
+    ctx.beginPath();
+    ctx.moveTo(node.x, node.y - 9);
+    ctx.lineTo(node.x + 9, node.y);
+    ctx.lineTo(node.x, node.y + 9);
+    ctx.lineTo(node.x - 9, node.y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    return;
+  }
+  if (node.kind === "posecurity" || node.kind === "edge") {
+    ctx.fillStyle = "#374151";
+    ctx.beginPath();
+    ctx.moveTo(node.x - 11, node.y - 7);
+    ctx.lineTo(node.x, node.y - 10);
+    ctx.lineTo(node.x + 11, node.y - 7);
+    ctx.lineTo(node.x + 11, node.y + 7);
+    ctx.lineTo(node.x, node.y + 10);
+    ctx.lineTo(node.x - 11, node.y + 7);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    return;
+  }
+  if (node.kind === "sink") {
+    ctx.setLineDash([3, 4]);
+    ctx.strokeStyle = "#ef4444";
+    ctx.fillStyle = "#111827";
+    ctx.fillRect(node.x - 46, node.y - 11, 92, 22);
+    ctx.strokeRect(node.x - 46, node.y - 11, 92, 22);
+    ctx.setLineDash([]);
+    return;
+  }
+  if (node.kind === "server") {
+    ctx.fillStyle = "#064e3b";
+    ctx.strokeStyle = "#34d399";
+    ctx.fillRect(node.x - 24, node.y - 13, 48, 26);
+    ctx.strokeRect(node.x - 24, node.y - 13, 48, 26);
+    return;
+  }
+  ctx.fillRect(node.x - 20, node.y - 10, 40, 20);
+  ctx.strokeRect(node.x - 20, node.y - 10, 40, 20);
+}
+
+// ---- the loop ----------------------------------------------------------------------------------
+
+let deciding = 0;
+
+// Packets that reached the guard and are waiting on a verdict. A packet stays here until
+// a scan slot frees, rather than being abandoned because the queue was momentarily full —
+// dropping it would mean a packet that was neither allowed nor withheld convincingly, and
+// it would silently leave the counters short of what the network spawned.
+const waiting = [];
+
+function frame(now) {
+  const dt = Math.min(64, now - (lastTime || now));
+  lastTime = now;
+  if (running) {
+    S.step(sim, dt);
+    // Structurally decided packets are shown immediately — they need no scan, and hiding
+    // them behind the scan queue would take a flood's whole result off the screen.
+    for (const packet of sim.structuralArrivals) {
+      const verdict = permittedFor({
+        sourceId: packet.sourceId,
+        kind: packet.kind,
+        quarantined: sim.quarantine.has(packet.sourceId),
+        priorViolations: sim.violations.get(packet.sourceId) || 0,
+        structural: packet.structural,
+        content: null,
+      });
+      addRow(packet, packet.response, verdict, {
+        tier: "structural",
+        reason: packet.structural.detail,
+        model: null,
+        findings: [],
+      });
+    }
+    for (const arrival of sim.arrivals) waiting.push(arrival);
+    // Bound the backlog. Only packets that have ALREADY been waiting get abandoned; the
+    // newest arrivals keep their place, so a flood cannot starve them.
+    while (waiting.length > S.SCAN_QUEUE_CAPACITY) {
+      const oldest = waiting.shift();
+      S.markUnavailable(sim, oldest.id,
+        `the guard could not keep up, so this packet was never inspected ` +
+        `(${S.SCAN_QUEUE_CAPACITY} scan slots, all busy)`);
+    }
+    while (deciding < S.SCAN_QUEUE_CAPACITY && waiting.length) {
+      const packet = waiting.shift();
+      deciding++;
+      decide(packet).finally(() => { deciding--; });
+    }
+    renderHud();
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+// ---- controls ------------------------------------------------------------------------------------
+
+$("toggle").addEventListener("click", () => {
+  running = !running;
+  $("toggle").textContent = running ? "pause" : "start";
+  $("status").textContent = running ? "streaming" : "paused";
+  if (running) lastTime = 0;
+});
+
+$("clear").addEventListener("click", () => {
+  sim = S.createSim({ seed: 1 });
+  deciding = 0;
+  waiting.length = 0;
+  hideBanner();
+  $("ledger").innerHTML = '<p class="muted">No packet has reached the guard yet.</p>';
+  renderHud();
+});
+
+// One click sends a BURST, not a packet. The structural layer is a window over time, so a
+// single packet can never be a flood or a sweep — the demo would be unable to show its own
+// headline scenario.
+//
+// Sized ABOVE the thresholds on purpose. A burst exactly at the limit (12 against a limit
+// of 12) trips the rule on its last packet and nothing else, so a "flood" would drop one
+// packet and allow eleven — technically correct, and a misleading thing to put on screen.
+// This is also the honest shape of rate limiting: the first packets of any burst get
+// through, and that is why a rate limiter belongs in front of an inspector rather than
+// instead of one.
+const BURST_SIZE = 20;
+
+for (const button of document.querySelectorAll("button[data-kind]")) {
+  button.addEventListener("click", () => {
+    let sent = 0;
+    for (let i = 0; i < BURST_SIZE; i++) {
+      if (!S.spawn(sim, button.dataset.kind, button.dataset.source || null)) break;
+      sent++;
+    }
+    $("status").textContent = sent === BURST_SIZE
+      ? `sent a burst of ${sent} ${button.dataset.kind}`
+      : `sent ${sent} of ${BURST_SIZE} — the network is at capacity`;
+  });
+}
+
+// The ontology panel. Reads the last passage, so a packet's permitted set is shown as the
+// ontology computes it, and editing the TBox changes what the next packet may be served
+// with. No enforcement switch: the rule removing a response IS the behaviour change.
+const ontologyRoot = $("ontologyPanel");
+let panel = null;
+if (ontologyRoot) {
+  panel = mountTrafficPanel({
+    root: ontologyRoot,
+    getSim: () => lastPassage,
+    onChange: () => { panel?.rerender(); },
+  });
+  // The ABox carries the live passage description, so it is repainted on a timer. Full
+  // re-renders — which the violation lines need, since they live outside the ABox host —
+  // rebuild the axiom rows and would steal focus from a half-typed axiom value, so they
+  // are skipped while anything inside the panel has focus.
+  setInterval(() => panel?.refreshABox(), 500);
+  setInterval(() => {
+    if (ontologyRoot.contains(document.activeElement)) return;
+    panel?.rerender();
+  }, 500);
+}
+
+renderHud();
+loadHealth();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -939,3 +939,46 @@ def test_lab_works_while_the_laya_router_is_cold(client, lab, monkeypatch):
     test_client, _ = client
     monkeypatch.setattr(server_module._RouterState, "router", None)
     assert test_client.get("/lab/api/status").status_code == 200
+
+
+def test_traffic_page_served():
+    """The traffic simulator rides the catch-all static mount like every other page, so
+    dropping it from static/ would only show up in a browser."""
+    response = TestClient(server_module.app).get("/traffic.html")
+    assert response.status_code == 200, response.text
+    assert "CJet inspects the traffic" in response.text
+    # It must load the pure modules the node tests drive, not an inlined copy. The page
+    # imports traffic_sim.js directly and traffic_ontology.js through traffic_panel.js,
+    # which is why the third name is here: a page that dropped the panel would stop
+    # mounting the ontology editor and nothing else would notice.
+    assert "/traffic_sim.js" in response.text
+    assert "/traffic_panel.js" in response.text
+
+
+def test_the_index_links_the_traffic_page():
+    response = TestClient(server_module.app).get("/")
+    assert response.status_code == 200
+    assert "traffic.html" in response.text
+
+
+def test_the_scan_route_is_not_shadowed_by_the_static_mount():
+    """A route registered BELOW the catch-all mount at "/" would be unreachable, and the
+    failure reads as a 404 from StaticFiles — like the route was never written.
+
+    Checked by POSTing to it and requiring that the HANDLER answered, not 404. A stub
+    guard is not installed here, so the route's own 503 ("guard is still loading") is the
+    proof it was reached; a 404 would mean the mount swallowed it.
+
+    Note what a GET returns, because it is a real curiosity rather than a bug: 404, not
+    405. Starlette treats a method mismatch as a PARTIAL match and keeps looking, and the
+    mount at "/" is a FULL match for every path — so it wins and StaticFiles answers. The
+    route is reachable for the method it declares; the 405 is simply masked.
+    """
+    test_client = TestClient(server_module.app)
+    response = test_client.post("/api/guard/scan", json={"message": "hi"})
+    assert response.status_code != 404, (
+        "POST /api/guard/scan 404ed, so the static mount is shadowing the route"
+    )
+    assert response.status_code == 503, (
+        f"expected the route's own 'still loading' 503, got {response.status_code}"
+    )
