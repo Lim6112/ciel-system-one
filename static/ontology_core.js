@@ -191,6 +191,10 @@ export const el = (tag, props = {}, ...kids) => {
  *                     OPTIONAL — omit both and no toggle is rendered, for domains
  *                     (breakout) whose enforcement switch lives outside the panel.
  *   note              the paragraph explaining what enforcement does and does not promise
+ *   labels            OPTIONAL — overrides for this file's own chrome, so a page can be
+ *                     presented in another language without forking the editor. Anything
+ *                     omitted falls back to the English in DEFAULT_LABELS, which is what
+ *                     every existing domain gets by not passing the field at all.
  *   onChange(what)    called after every mutation, and after the enforce toggle
  *
  * The editor is created ONCE and mutated in place, so `rerender()` never rebuilds the
@@ -198,9 +202,34 @@ export const el = (tag, props = {}, ...kids) => {
  * half-typed value. `adapter.pristine` must be captured when the adapter is BUILT, not at
  * module load, or the second domain's snapshot captures the first one's TBox.
  */
+
+/**
+ * The editor's own chrome, in English.
+ *
+ * Per-domain so a page can be another language without a second editor (see `labels`
+ * above). The domain's own words — axiom comments, ABox rows, the closing note — are not
+ * here: those come from the adapter already, because only the domain knows them.
+ */
+export const DEFAULT_LABELS = {
+  tboxHeading: n => `Ontology — TBox (${n} axioms)`,
+  aboxHeading: "Ontology — ABox (what it currently believes)",
+  consistencyOk: "consistency: satisfiable — the axiom set is coherent",
+  consistencyBad: details => "UNSATISFIABLE: " + details,
+  notAsserted: (ids, texts) =>
+    `not asserted: ${ids} — the ontology no longer enforces ${texts} ` +
+    `(shown as declared by default)`,
+  declared: "declared",
+  add: "add",
+  reset: "reset to declared defaults",
+  removeAxiom: "remove this axiom",
+  violationSuffix: n => ` · ${n} violation(s)`,
+  unassertedSuffix: " · unasserted",
+};
+
 export function mountTBoxEditor({ root, adapter }) {
   const { tbox, implementedForms, vocabulary, aboxFor, notes, enforceChecked, setEnforce,
           note, onChange } = adapter;
+  const labels = { ...DEFAULT_LABELS, ...(adapter.labels ?? {}) };
   const pristine = adapter.pristine ?? tbox.map(a => ({ ...a }));
   const forms = offerableForms(implementedForms);
   const aboxHost = el("div", { className: "abox" });
@@ -212,9 +241,11 @@ export function mountTBoxEditor({ root, adapter }) {
       el("strong", { textContent: b.id }),
       ` ${b.detail}`,
       b.violations.length
-        ? el("span", { className: "bad", textContent: ` · ${b.violations.length} violation(s)` })
+        ? el("span", { className: "bad", textContent: labels.violationSuffix(b.violations.length) })
         : null,
-      b.unasserted.length ? el("span", { className: "warn", textContent: " · unasserted" }) : null,
+      b.unasserted.length
+        ? el("span", { className: "warn", textContent: labels.unassertedSuffix })
+        : null,
     )));
   };
 
@@ -231,7 +262,7 @@ export function mountTBoxEditor({ root, adapter }) {
       // A disjoint axiom's value is its class list, which `describeAxiom` already
       // renders — a second, truncated copy of it in the value column helps nobody.
       const value = a.form === "disjoint"
-        ? el("span", { className: "axnone", textContent: "declared" })
+        ? el("span", { className: "axnone", textContent: labels.declared })
         : numeric
         ? el("input", { type: "number", min: "0", value: String(a.value), className: "axval" })
         : el("span", { className: "axval axfixed", textContent: String(a.value) });
@@ -249,24 +280,25 @@ export function mountTBoxEditor({ root, adapter }) {
         el("code", { className: "axtext", textContent: describeAxiom(a) }),
         value,
         el("button", {
-          className: "axdel", title: "remove this axiom", textContent: "×",
+          className: "axdel", title: labels.removeAxiom, textContent: "×",
           onclick: () => { removeAxiom(tbox, a.id); onChange(a.id); },
         }),
         a.comment ? el("div", { className: "axnote", textContent: a.comment }) : null,
       ));
     }
-    root.append(el("h2", { textContent: `Ontology — TBox (${tbox.length} axioms)` }), list);
+    root.append(el("h2", { textContent: labels.tboxHeading(tbox.length) }), list);
 
     if (status.missing.length) {
       root.append(el("div", { className: "warn" },
-        `not asserted: ${status.missing.map(m => m.id).join(", ")} — ` +
-        `the ontology no longer enforces ${status.missing.map(m => m.text).join("; ")} ` +
-        `(shown as declared by default)`));
+        labels.notAsserted(
+          status.missing.map(m => m.id).join(", "),
+          status.missing.map(m => m.text).join("; "),
+        )));
     }
     root.append(el("div", { className: status.satisfiable ? "ok" : "bad" },
       status.satisfiable
-        ? "consistency: satisfiable — the axiom set is coherent"
-        : "UNSATISFIABLE: " + status.unsatisfiable.map(u => `${u.id} (${u.reason})`).join("; ")));
+        ? labels.consistencyOk
+        : labels.consistencyBad(status.unsatisfiable.map(u => `${u.id} (${u.reason})`).join("; "))));
 
     for (const n of notes(sim)) {
       root.append(el("div", { className: n.ok ? "ok" : "bad", textContent: n.text }));
@@ -293,7 +325,7 @@ export function mountTBoxEditor({ root, adapter }) {
     fSel.addEventListener("change", syncValueForForm);
     const msg = el("span", { className: "axmsg" });
     root.append(el("div", { className: "axadd" },
-      el("span", { className: "axaddlbl", textContent: "add" }),
+      el("span", { className: "axaddlbl", textContent: labels.add }),
       fSel, sSel, pSel, vIn,
       el("button", {
         className: "axbtn", textContent: "+",
@@ -313,8 +345,7 @@ export function mountTBoxEditor({ root, adapter }) {
     // aboxHost is created once and reused across every rerender, so it can be refreshed
     // on a timer without touching the axiom rows — rebuilding the whole panel on a tick
     // would steal focus from a value input mid-edit.
-    root.append(el("h2", { textContent: "Ontology — ABox (what it currently believes)" }),
-                aboxHost);
+    root.append(el("h2", { textContent: labels.aboxHeading }), aboxHost);
     refreshABox();
 
     // --- enforcement toggle, ONLY when the domain has one. Breakout drives enforcement
@@ -333,7 +364,7 @@ export function mountTBoxEditor({ root, adapter }) {
     root.append(el("div", { className: "axnote", textContent: note }));
 
     root.append(el("div", { className: "axreset" },
-      el("button", { className: "axbtn", textContent: "reset to declared defaults",
+      el("button", { className: "axbtn", textContent: labels.reset,
                      onclick: () => { resetTBox(tbox, pristine, adapter.onReset); onChange("reset"); } })));
   };
 

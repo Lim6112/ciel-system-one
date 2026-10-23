@@ -862,12 +862,16 @@ def client(monkeypatch):
         def scan(self, text, arm, stage=guard_pii.INPUT_STAGE):
             self.calls.append((text, arm.key, stage))
             report = guard_pii.GuardReport(arm_model_pii_blocks=arm.model_pii_blocks)
+            finding = guard_pii.Finding("laya", guard_pii.PII_CATEGORY, 0.9, "sensitive_data")
             if "ssn" in text:
                 report.blocked = True
                 report.reason = "a personal identifier was found in the text"
-            report.findings.append(
-                guard_pii.Finding("laya", guard_pii.PII_CATEGORY, 0.9, "sensitive_data")
-            )
+                # _findings_payload marks the blocker by IDENTITY, so a report that sets
+                # `blocked` without naming `blocker` produces a blocked turn in which no
+                # finding is flagged — the UI would mark none of them as the cause. The
+                # stub has to name it or the flag is never exercised.
+                report.blocker = finding
+            report.findings.append(finding)
             return report
 
     stub = StubGuard()
@@ -968,3 +972,217 @@ def test_predict_and_guard_chat_share_one_lock(client):
         held.release()
     guard_turn.join(timeout=5)
     assert not guard_turn.is_alive()
+
+
+# ---- the scan route (the traffic demo's content tier) ----------------------------------------
+
+
+@pytest.fixture()
+def scan_client(monkeypatch):
+    """A TestClient whose guard is REAL, with only the laya detector stubbed.
+
+    Unlike the `client` fixture, the guard here is a real `guard_pii.Guard`, so the regex
+    scanner runs for real and a real `report.blocker` reaches the real
+    `guard_agent._findings_payload`. That is what makes the route's response a real
+    assertion about the shipped serialization rather than about a stub.
+
+    The laya detector is stubbed because the scan route is about the detection AND the
+    wiring, and a real checkpoint is a 30-second load; the scanner needs no model at all,
+    so a secret still drives a genuine block through the whole path.
+
+    Installed the same way the `client` fixture does it, and — like it — deliberately
+    NOT as a `with` block, so the lifespan and the real chat model never run.
+    """
+    from fastapi.testclient import TestClient
+
+    import server as server_module
+
+    guard = guard_pii.Guard()
+    guard.laya = StubLayaDetector()
+    guarded = guard_agent.build_agent(
+        chat_model=FakeToolCallingModel(messages=iter([AIMessage(content="unused")])),
+        guard=guard,
+    )
+    monkeypatch.setattr(server_module, "_AgentState", type("S", (), {"agent": guarded}))
+    yield TestClient(server_module.app), guard
+
+
+def test_scan_returns_findings_for_a_clean_packet(scan_client):
+    test_client, _ = scan_client
+    response = test_client.post("/api/guard/scan", json={"message": "Where is my order A1?"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["arm"] == "english"
+    assert body["blocked"] is False
+    assert body["arm_model_pii_blocks"] is True
+    assert "answer" not in body, "the scan route must not answer — there is nothing to answer"
+
+
+def test_scan_blocks_a_packet_carrying_a_secret(scan_client):
+    test_client, _ = scan_client
+    response = test_client.post(
+        "/api/guard/scan",
+        json={"message": "here is my key sk-proj-abc123XYZdef456ghi789, please use it"},
+    )
+    body = response.json()
+    assert body["blocked"] is True
+    assert body["reason"]
+
+
+def test_scan_flags_exactly_one_finding_as_the_blocker(scan_client):
+    """`blocked` by identity, not by value.
+
+    Two identical matches are equal dataclasses; comparing by value would mark both as
+    the blocker when only the first tripped.
+    """
+    test_client, _ = scan_client
+    response = test_client.post(
+        "/api/guard/scan", json={"message": "SSN 123-45-6789 and key sk-proj-abc123XYZdef456ghi789"}
+    )
+    body = response.json()
+    flagged = [f for f in body["findings"] if f["blocked"]]
+    assert len(flagged) == 1, f"expected one blocker, got {flagged}"
+
+
+def test_scan_never_returns_the_raw_secret(scan_client):
+    """A finding travels to the browser, so it must not carry a slice of what it found."""
+    secret = "sk-proj-abc123XYZdef456ghi789"
+    test_client, _ = scan_client
+    response = test_client.post("/api/guard/scan", json={"message": f"my key is {secret}"})
+    assert secret not in response.text
+    assert "sk-p" in response.text
+
+
+def test_scan_reports_the_arm_opinion_policy(scan_client):
+    """The field that lets the page say the true thing on an arm that cannot block."""
+    test_client, _ = scan_client
+    laya = test_client.post("/api/guard/scan", json={"message": "hi", "model": "english"})
+    assert laya.json()["arm_model_pii_blocks"] is True
+    lab = test_client.post(
+        "/api/guard/scan", json={"message": "hi", "model": "ciel_typed_v1", "path": "typed"}
+    )
+    assert lab.status_code == 200
+    assert lab.json()["arm_model_pii_blocks"] is False
+
+
+def test_scan_refuses_an_unknown_arm(scan_client):
+    test_client, _ = scan_client
+    response = test_client.post("/api/guard/scan", json={"message": "hi", "model": "nope"})
+    assert response.status_code == 400
+
+
+def test_scan_refuses_a_path_on_an_arm_without_sub_paths(scan_client):
+    test_client, _ = scan_client
+    response = test_client.post(
+        "/api/guard/scan", json={"message": "hi", "model": "english", "path": "typed"}
+    )
+    assert response.status_code == 400
+
+
+def test_scan_rejects_an_empty_message(scan_client):
+    test_client, _ = scan_client
+    assert test_client.post("/api/guard/scan", json={"message": ""}).status_code == 422
+
+
+def test_scan_rejects_an_oversized_message(scan_client):
+    test_client, _ = scan_client
+    huge = "a" * (server_module_chars() + 1)
+    assert test_client.post("/api/guard/scan", json={"message": huge}).status_code == 422
+
+
+def server_module_chars():
+    import server as server_module
+    return server_module.MAX_MESSAGE_CHARS
+
+
+def test_scan_reports_a_dead_detector_as_unavailable_not_clean(scan_client, monkeypatch):
+    """The contract the traffic page's Inspect tier depends on.
+
+    A detector that cannot be reached is not a clean verdict. It travels as a finding with
+    the `detector_unavailable` category, so the page can withdraw Allow and hold the flow.
+    """
+    test_client, _ = scan_client
+
+    import guard_pii as gp
+
+    def dead(text, path="typed"):
+        return [gp.Finding("decision_lab", gp.UNAVAILABLE_CATEGORY, 0.0, "unreachable")]
+
+    monkeypatch.setattr(scan_client[1].lab, "scan", dead)
+    response = test_client.post(
+        "/api/guard/scan", json={"message": "hi", "model": "ciel_typed_v1", "path": "typed"}
+    )
+    body = response.json()
+    categories = {f["category"] for f in body["findings"]}
+    assert gp.UNAVAILABLE_CATEGORY in categories
+    assert body["blocked"] is False, "an outage is not a block — it is a gap in coverage"
+
+
+def test_scan_503s_when_there_is_no_guard(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import server as server_module
+
+    monkeypatch.setattr(server_module, "_AgentState", type("S", (), {"agent": None}))
+    test_client = TestClient(server_module.app)
+    response = test_client.post("/api/guard/scan", json={"message": "hi"})
+    assert response.status_code == 503
+
+
+def test_the_scan_route_is_sync():
+    """Same reasoning as the chat route: the scan takes the device lock, and holding a
+    threading.Lock across an await on the event-loop thread deadlocks the server."""
+    import inspect
+
+    import server as server_module
+
+    assert not inspect.iscoroutinefunction(server_module.guard_scan_text)
+
+
+def test_predict_and_guard_scan_share_one_lock(scan_client):
+    """The scan runs a laya checkpoint, exactly as /api/predict does. Two locks would let
+    them collide holding different ones."""
+    import server as server_module
+
+    test_client, _ = scan_client
+    held = server_module._RouterState.device_lock
+    assert held.acquire(timeout=1), "the device lock was already held"
+    try:
+        scan = threading.Thread(
+            target=test_client.post,
+            args=("/api/guard/scan",),
+            kwargs={"json": {"message": "where is order A1?"}},
+        )
+        scan.start()
+        scan.join(timeout=0.3)
+        assert scan.is_alive(), "the scan route did not take the device lock"
+    finally:
+        held.release()
+    scan.join(timeout=5)
+    assert not scan.is_alive()
+
+
+def test_scan_findings_are_the_same_payload_as_the_chat_trace(scan_client):
+    """The DRY assertion: the two routes cannot drift to two serializers.
+
+    Both go through `guard_agent._findings_payload`, so the shape and the `blocked` flag
+    agree by construction. Comparing against that function directly is what pins it.
+    """
+    test_client, guard = scan_client
+    text = "my key is sk-proj-abc123XYZdef456ghi789"
+    arm = guard_pii.resolve_arm("english")
+    expected = guard_agent._findings_payload(guard.scan(text, arm, stage=guard_pii.INPUT_STAGE))
+    got = test_client.post("/api/guard/scan", json={"message": text}).json()["findings"]
+    assert got == expected
+
+
+def test_scan_does_not_touch_the_agents_chat_model(scan_client):
+    """A scan is not a turn. If this ever calls the chat model, every packet pays two
+    model round trips for an answer nobody reads."""
+    test_client, guard = scan_client
+    calls_before = len(guard_agent.tool_calls_made()) if hasattr(
+        guard_agent, "tool_calls_made") else 0
+    test_client.post("/api/guard/scan", json={"message": "Where is my order A1?"})
+    calls_after = len(guard_agent.tool_calls_made()) if hasattr(
+        guard_agent, "tool_calls_made") else 0
+    assert calls_after == calls_before, "a scan executed a tool"
